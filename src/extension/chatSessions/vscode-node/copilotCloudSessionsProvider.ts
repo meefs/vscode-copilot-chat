@@ -210,7 +210,15 @@ export class CopilotChatSessionsProvider extends Disposable implements vscode.Ch
 				this.chatSessions.set(pr.number, pr);
 				return session;
 			}));
-			const filteredSessions = sessionItems.filter(item => item !== undefined);
+			const filteredSessions = sessionItems
+				// Remove any undefined sessions
+				.filter(item => item !== undefined)
+				// Only keep sessions with attached PRs not CLOSED or MERGED
+				.filter(item => {
+					const pr = item.pullRequestDetails;
+					const state = pr.state.toUpperCase();
+					return state !== 'CLOSED' && state !== 'MERGED';
+				});
 
 			vscode.commands.executeCommand('setContext', 'github.copilot.chat.cloudSessionsEmpty', filteredSessions.length === 0);
 			return filteredSessions;
@@ -254,6 +262,10 @@ export class CopilotChatSessionsProvider extends Disposable implements vscode.Ch
 			}
 			const jobInfo = await this._octoKitService.getJobBySessionId(repoId.org, repoId.repo, sessions[0].id, 'vscode-copilot-chat');
 			let prompt = jobInfo.problem_statement;
+			if (typeof jobInfo.problem_statement !== 'string') {
+				return undefined;
+			}
+
 			const titleMatch = jobInfo.problem_statement.match(/TITLE: \s*(.*)/i);
 			if (titleMatch && titleMatch[1]) {
 				prompt = titleMatch[1].trim();
@@ -982,8 +994,7 @@ export class CopilotChatSessionsProvider extends Disposable implements vscode.Ch
 		let head_ref: string | undefined; // This is the ref cloud agent starts work from (omitted unless we push local changes)
 
 		// Check for uncommitted changes and prompt user if checking is enabled
-		const hasChanges =
-			((currentRepository?.changes?.workingTree && currentRepository.changes.workingTree.length > 0) || (currentRepository?.changes?.indexChanges && currentRepository.changes.indexChanges.length > 0));
+		const hasChanges = repo.state.workingTreeChanges.length > 0 || repo.state.indexChanges.length > 0;
 		if (checkForChanges && hasChanges) {
 			this.logService.warn('Uncommitted changes detected, prompting user for confirmation.');
 			if (chatStream) {
