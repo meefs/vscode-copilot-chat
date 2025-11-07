@@ -6,6 +6,8 @@
 import * as pathLib from 'path';
 import * as vscode from 'vscode';
 import { Uri } from 'vscode';
+import { IAuthenticationService } from '../../../platform/authentication/common/authentication';
+import { IAuthenticationChatUpgradeService } from '../../../platform/authentication/common/authenticationUpgrade';
 import { IGitExtensionService } from '../../../platform/git/common/gitExtensionService';
 import { IGitService } from '../../../platform/git/common/gitService';
 import { PullRequestSearchItem, SessionInfo } from '../../../platform/github/common/githubAPI';
@@ -16,8 +18,6 @@ import { Disposable, toDisposable } from '../../../util/vs/base/common/lifecycle
 import { body_suffix, CONTINUE_TRUNCATION, extractTitle, formatBodyPlaceholder, getAuthorDisplayName, getRepoId, JOBS_API_VERSION, RemoteAgentResult, SessionIdForPr, toOpenPullRequestWebviewUri, truncatePrompt } from '../vscode/copilotCodingAgentUtils';
 import { ChatSessionContentBuilder } from './copilotCloudSessionContentBuilder';
 import { IPullRequestFileChangesService } from './pullRequestFileChangesService';
-import { IAuthenticationChatUpgradeService } from '../../../platform/authentication/common/authenticationUpgrade';
-import { IAuthenticationService } from '../../../platform/authentication/common/authentication';
 
 export type ConfirmationResult = { step: string; accepted: boolean; metadata?: ConfirmationMetadata };
 
@@ -100,6 +100,9 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 			}
 		}, BACKGROUND_REFRESH_INTERVAL_MS);
 		this._register(toDisposable(() => clearInterval(interval)));
+		this._register(this._authenticationService.onDidAuthenticationChange(() => {
+			this.refresh();
+		}));
 	}
 
 	public refresh(): void {
@@ -592,8 +595,13 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 
 	private async chatParticipantImpl(request: vscode.ChatRequest, context: vscode.ChatContext, stream: vscode.ChatResponseStream, token: vscode.CancellationToken) {
 		if (request.acceptedConfirmationData || request.rejectedConfirmationData) {
-			const findConfirmRequest = request.acceptedConfirmationData?.find(ref => ref?.authPermissionPrompted);
-			if (findConfirmRequest) {
+			const findAuthConfirmRequest = request.acceptedConfirmationData?.find(ref => ref?.authPermissionPrompted);
+			const findAuthRejectRequest = request.rejectedConfirmationData?.find(ref => ref?.authPermissionPrompted);
+			if (findAuthRejectRequest) {
+				stream.markdown(vscode.l10n.t('Cloud agent authentication requirements not met. Please allow access to proceed.'));
+				return {};
+			}
+			if (findAuthConfirmRequest) {
 				const result = await this._authenticationUpgradeService.handleConfirmationRequestWithContext(stream, request, context.history);
 				request = result.request;
 				context = result.context ?? context;
@@ -1234,7 +1242,22 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 			const response = await this._octoKitService.postCopilotAgentJob(repoId.org, repoId.repo, JOBS_API_VERSION, payload);
 			if (!this.validateRemoteAgentJobResponse(response)) {
 				const statusCode = response?.status;
-				return { error: vscode.l10n.t('Received invalid response {0}from cloud agent.', statusCode ? statusCode + ' ' : ''), innerError: `Response ${JSON.stringify(response)}`, state: 'error' };
+				switch (statusCode) {
+					case 422:
+						// NOTE: Although earlier checks should prevent this, ensure that if we end up
+						//       with a 422 from the API, we give a useful error message
+						return {
+							error: vscode.l10n.t('The cloud agent was unable to create a pull request with the specified base branch \'{0}\'. Please push branch to the remote and try again.', base_ref),
+							innerError: `Status code 422 received from cloud agent.`,
+							state: 'error',
+						};
+					default:
+						return {
+							error: vscode.l10n.t('Received invalid response {0}from cloud agent.', statusCode ? statusCode + ' ' : ''),
+							innerError: `Response ${JSON.stringify(response)}`,
+							state: 'error',
+						};
+				}
 			}
 			// For v1 API, we need to fetch the job details to get the PR info
 			// Since the PR might not be created immediately, we need to poll for it
