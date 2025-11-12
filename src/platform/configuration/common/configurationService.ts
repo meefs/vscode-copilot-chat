@@ -660,7 +660,7 @@ export namespace ConfigKey {
 		export const InlineEditsNextCursorPredictionDisplayLine = defineExpSetting<boolean>('chat.advanced.inlineEdits.nextCursorPrediction.displayLine', true, INTERNAL);
 		export const InlineEditsNextCursorPredictionCurrentFileMaxTokens = defineExpSetting<number>('chat.advanced.inlineEdits.nextCursorPrediction.currentFileMaxTokens', xtabPromptOptions.DEFAULT_OPTIONS.currentFile.maxTokens, INTERNAL);
 		export const InlineEditsNextCursorPredictionEnabled = defineExpSetting<NextCursorLinePrediction | boolean | undefined>('chat.advanced.inlineEdits.nextCursorPrediction.enabled', { defaultValue: undefined, teamDefaultValue: NextCursorLinePrediction.LabelOnlyWithEdit }, INTERNAL_RESTRICTED);
-		export const InlineEditsNextCursorPredictionModelName = defineExpSetting<string | undefined>('chat.advanced.inlineEdits.nextCursorPrediction.modelName', { defaultValue: undefined, teamDefaultValue: "xtab-cursor-jump-v2" }, INTERNAL_RESTRICTED);
+		export const InlineEditsNextCursorPredictionModelName = defineExpSetting<string | undefined>('chat.advanced.inlineEdits.nextCursorPrediction.modelName', { defaultValue: undefined, teamDefaultValue: "xtab-cursor-jump-1104" }, INTERNAL_RESTRICTED);
 		export const InlineEditsNextCursorPredictionUrl = defineValidatedSetting<string | undefined>('chat.advanced.inlineEdits.nextCursorPrediction.url', vString(), undefined, INTERNAL_RESTRICTED);
 		export const InlineEditsNextCursorPredictionApiKey = defineValidatedSetting<string | undefined>('chat.advanced.inlineEdits.nextCursorPrediction.apiKey', vString(), undefined, INTERNAL_RESTRICTED);
 		export const InlineEditsXtabProviderUrl = defineValidatedSetting<string | undefined>('chat.advanced.inlineEdits.xtabProvider.url', vString(), undefined, INTERNAL_RESTRICTED);
@@ -776,9 +776,6 @@ export namespace ConfigKey {
 	/** Enable memory tool */
 	export const MemoryToolEnabled = defineExpSetting<boolean>('chat.tools.memory.enabled', false);
 
-	/** Add context from recently used files */
-	export const TemporalContextInlineChatEnabled = defineExpSetting<boolean>('chat.editor.temporalContext.enabled', false);
-	export const TemporalContextEditsEnabled = defineExpSetting<boolean>('chat.edits.temporalContext.enabled', false);
 	/** User provided code generation instructions for the chat */
 	export const CodeGenerationInstructions = defineSetting('chat.codeGeneration.instructions', [] as CodeGenerationInstruction[]);
 	export const TestGenerationInstructions = defineSetting('chat.testGeneration.instructions', [] as CodeGenerationInstruction[]);
