@@ -119,12 +119,14 @@ export class AnthropicLMProvider implements BYOKModelProvider<LanguageModelChatI
 		this._apiKey = await promptForAPIKey(AnthropicLMProvider.providerName, await this._byokStorageService.getAPIKey(AnthropicLMProvider.providerName) !== undefined);
 		if (this._apiKey) {
 			await this._byokStorageService.storeAPIKey(AnthropicLMProvider.providerName, this._apiKey, BYOKAuthType.GlobalApiKey);
+			this._anthropicAPIClient = undefined;
 		}
 	}
 
 	async updateAPIKeyViaCmd(envVarName: string, action: 'update' | 'remove' = 'update', modelId?: string): Promise<void> {
 		if (action === 'remove') {
 			this._apiKey = undefined;
+			this._anthropicAPIClient = undefined;
 			await this._byokStorageService.deleteAPIKey(AnthropicLMProvider.providerName, this.authType, modelId);
 			this._logService.info(`BYOK: API key removed for provider ${AnthropicLMProvider.providerName}`);
 			return;
@@ -137,6 +139,7 @@ export class AnthropicLMProvider implements BYOKModelProvider<LanguageModelChatI
 
 		this._apiKey = apiKey;
 		await this._byokStorageService.storeAPIKey(AnthropicLMProvider.providerName, apiKey, this.authType, modelId);
+		this._anthropicAPIClient = undefined;
 		this._logService.info(`BYOK: API key updated for provider ${AnthropicLMProvider.providerName} from environment variable ${envVarName}`);
 	}
 
@@ -157,7 +160,20 @@ export class AnthropicLMProvider implements BYOKModelProvider<LanguageModelChatI
 					return [];
 				}
 			}
-		} catch {
+		} catch (error) {
+			if (error instanceof Error && error.message.includes('invalid x-api-key')) {
+				if (options.silent) {
+					return [];
+				}
+				await this.updateAPIKey();
+				if (this._apiKey) {
+					try {
+						return byokKnownModelsToAPIInfo(AnthropicLMProvider.providerName, await this.getAllModels(this._apiKey));
+					} catch (retryError) {
+						this._logService.error(`Error after re-prompting for API key: ${toErrorMessage(retryError, true)}`);
+					}
+				}
+			}
 			return [];
 		}
 	}
@@ -374,7 +390,7 @@ export class AnthropicLMProvider implements BYOKModelProvider<LanguageModelChatI
 
 		const stream = await this._anthropicAPIClient.beta.messages.create({
 			...params,
-			betas
+			...(betas.length > 0 && { betas })
 		});
 
 		let pendingToolCall: {
