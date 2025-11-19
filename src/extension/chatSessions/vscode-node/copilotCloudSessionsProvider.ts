@@ -675,10 +675,23 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 		return {};
 	}
 
+	private hasHistoryToSummarize(history: readonly (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[]): boolean {
+		if (!history || history.length === 0) {
+			return false;
+		}
+		const allResponsesEmpty = history.every(turn => {
+			if (turn instanceof vscode.ChatResponseTurn) {
+				return turn.response.length === 0;
+			}
+			return true;
+		});
+		return !allResponsesEmpty;
+	}
+
 	async createDelegatedChatSession(metadata: ConfirmationMetadata, stream: vscode.ChatResponseStream, token: vscode.CancellationToken): Promise<PullRequestInfo | undefined> {
 		const { prompt, references } = metadata;
 		let history: string | undefined;
-		if (metadata.chatContext?.history.length > 0) {
+		if (this.hasHistoryToSummarize(metadata.chatContext.history)) {
 			stream.progress(vscode.l10n.t('Analyzing chat history'));
 			history = await this._summarizer.provideChatSummary(metadata.chatContext, token);
 		}
@@ -875,7 +888,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 			/* Generate new cloud agent session from an 'untitled' session */
 
 			const handledUncommittedChanges = await this.tryHandleUncommittedChanges({
-				prompt: context.chatSummary?.prompt ?? request.prompt,
+				prompt: request.prompt,
 				references: request.references,
 				chatContext: context
 			}, stream, token);
@@ -886,9 +899,10 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 				return {};
 			}
 
+			const { prompt, references } = request;
 			await this.doUntitledCreation({
-				prompt: context.chatSummary?.prompt ?? request.prompt,
-				references: request.references,
+				prompt,
+				references,
 				chatContext: context,
 			}, stream, token);
 
@@ -961,7 +975,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 				{
 					step: 'create',
 					metadata: {
-						prompt: context.chatSummary?.prompt ?? request.prompt,
+						prompt: request.prompt,
 						references: request.references,
 						chatContext: context,
 					} satisfies ConfirmationMetadata
