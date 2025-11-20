@@ -21,15 +21,23 @@ import { ToolCall } from '../../agents/copilotcli/common/copilotCLITools';
 import { ICopilotCLIModels } from '../../agents/copilotcli/node/copilotCli';
 import { CopilotCLIPromptResolver } from '../../agents/copilotcli/node/copilotcliPromptResolver';
 import { ICopilotCLISession } from '../../agents/copilotcli/node/copilotcliSession';
-import { ICopilotCLISessionService } from '../../agents/copilotcli/node/copilotcliSessionService';
+import { ICopilotCLISessionItem, ICopilotCLISessionService } from '../../agents/copilotcli/node/copilotcliSessionService';
 import { PermissionRequest, requestPermission } from '../../agents/copilotcli/node/permissionHelpers';
 import { ChatSummarizerProvider } from '../../prompt/node/summarizer';
 import { IToolsService } from '../../tools/common/toolsService';
 import { ICopilotCLITerminalIntegration } from './copilotCLITerminalIntegration';
-import { ConfirmationResult, CopilotCloudSessionsProvider, UncommittedChangesStep } from './copilotCloudSessionsProvider';
+import { CopilotCloudSessionsProvider } from './copilotCloudSessionsProvider';
 
 const MODELS_OPTION_ID = 'model';
 const ISOLATION_OPTION_ID = 'isolation';
+
+const UncommittedChangesStep = 'uncommitted-changes';
+type ConfirmationResult = { step: string; accepted: boolean; metadata?: CLIConfirmationMetadata };
+interface CLIConfirmationMetadata {
+	prompt: string;
+	references?: readonly vscode.ChatPromptReference[];
+	chatContext: vscode.ChatContext;
+}
 
 // Track model selections per session
 // TODO@rebornix: we should have proper storage for the session model preference (revisit with API)
@@ -198,12 +206,12 @@ export class CopilotCLIChatSessionItemProvider extends Disposable implements vsc
 		return diskSessions;
 	}
 
-	private async _toChatSessionItem(session: { id: string; label: string; startTime: Date; endTime?: Date; status?: vscode.ChatSessionStatus }): Promise<vscode.ChatSessionItem> {
+	private async _toChatSessionItem(session: ICopilotCLISessionItem): Promise<vscode.ChatSessionItem> {
 		const resource = SessionIdForCLI.getResource(session.id);
 		const worktreePath = this.worktreeManager.getWorktreePath(session.id);
 		const worktreeRelativePath = this.worktreeManager.getWorktreeRelativePath(session.id);
 
-		const label = session.label ?? vscode.l10n.t('Background Agent Session');
+		const label = session.label;
 		const tooltipLines = [vscode.l10n.t(`Background agent session: {0}`, label)];
 		let description: vscode.MarkdownString | undefined;
 		let statistics: { files: number; insertions: number; deletions: number } | undefined;
@@ -226,7 +234,7 @@ export class CopilotCLIChatSessionItemProvider extends Disposable implements vsc
 			label,
 			description,
 			tooltip: tooltipLines.join('\n'),
-			timing: { startTime: session.startTime.getTime(), endTime: session.endTime?.getTime() },
+			timing: session.timing,
 			statistics,
 			status
 		} satisfies vscode.ChatSessionItem;
@@ -414,7 +422,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			}
 
 			if (!isUntitled && confirmationResults.length) {
-				return await this.handleConfirmationData(session.object, request.prompt, confirmationResults, context, stream, token);
+				return await this.handleConfirmationData(request, session.object, request.prompt, confirmationResults, context, stream, token);
 			}
 
 			if (request.prompt.startsWith('/delegate')) {
@@ -499,18 +507,12 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		}
 
 		const prompt = request.prompt.substring('/delegate'.length).trim();
-		if (!await this.cloudSessionProvider.tryHandleUncommittedChanges({
-			prompt: prompt,
-			chatContext: context
-		}, stream, token)) {
-			const prInfo = await this.cloudSessionProvider.createDelegatedChatSession({
-				prompt,
-				chatContext: context
-			}, stream, token);
-			if (prInfo) {
-				await this.recordPushToSession(session, request.prompt, prInfo);
-			}
+
+		const prInfo = await this.cloudSessionProvider.delegate(request, stream, context, token, { prompt, chatContext: context });
+		if (prInfo) {
+			await this.recordPushToSession(session, request.prompt, prInfo);
 		}
+
 	}
 
 	private getAcceptedRejectedConfirmationData(request: vscode.ChatRequest): ConfirmationResult[] {
@@ -521,7 +523,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		return results;
 	}
 
-	private async handleConfirmationData(session: ICopilotCLISession, prompt: string, results: ConfirmationResult[], context: vscode.ChatContext, stream: vscode.ChatResponseStream, token: vscode.CancellationToken) {
+	private async handleConfirmationData(request: vscode.ChatRequest, session: ICopilotCLISession, prompt: string, results: ConfirmationResult[], context: vscode.ChatContext, stream: vscode.ChatResponseStream, token: vscode.CancellationToken) {
 		const uncommittedChangesData = results.find(data => data.step === UncommittedChangesStep);
 		if (!uncommittedChangesData) {
 			stream.warning(`Unknown confirmation step: ${results.map(r => r.step).join(', ')}\n\n`);
@@ -533,12 +535,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			return {};
 		}
 
-		const prInfo = await this.cloudSessionProvider?.createDelegatedChatSession({
-			prompt: uncommittedChangesData.metadata.prompt,
-			references: uncommittedChangesData.metadata.references,
-			autoPushAndCommit: uncommittedChangesData.metadata.autoPushAndCommit,
-			chatContext: context
-		}, stream, token);
+		const prInfo = await this.cloudSessionProvider?.delegate(request, stream, context, token, uncommittedChangesData.metadata);
 		if (prInfo) {
 			await this.recordPushToSession(session, prompt, prInfo);
 		}
@@ -580,13 +577,13 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 	private async recordPushToSession(
 		session: ICopilotCLISession,
 		userPrompt: string,
-		prInfo: { uri: string; title: string; description: string; author: string; linkTag: string }
+		prInfo: { uri: vscode.Uri; title: string; description: string; author: string; linkTag: string }
 	): Promise<void> {
 		// Add user message event
 		session.addUserMessage(userPrompt);
 
 		// Add assistant message event with embedded PR metadata
-		const assistantMessage = `GitHub Copilot cloud agent has begun working on your request. Follow its progress in the associated chat and pull request.\n<pr_metadata uri="${prInfo.uri}" title="${escapeXml(prInfo.title)}" description="${escapeXml(prInfo.description)}" author="${escapeXml(prInfo.author)}" linkTag="${escapeXml(prInfo.linkTag)}"/>`;
+		const assistantMessage = `GitHub Copilot cloud agent has begun working on your request. Follow its progress in the associated chat and pull request.\n<pr_metadata uri="${prInfo.uri.toString()}" title="${escapeXml(prInfo.title)}" description="${escapeXml(prInfo.description)}" author="${escapeXml(prInfo.author)}" linkTag="${escapeXml(prInfo.linkTag)}"/>`;
 		session.addUserAssistantMessage(assistantMessage);
 	}
 }
