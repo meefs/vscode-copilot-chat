@@ -2762,7 +2762,9 @@
 					},
 					"github.copilot.chat.githubMcpServer.toolsets": {
 						"type": "array",
-						"default": ["default"],
+						"default": [
+							"default"
+						],
 						"markdownDescription": "%github.copilot.config.githubMcpServer.toolsets%",
 						"items": {
 							"type": "string"
@@ -3209,6 +3211,22 @@
 							"experimental"
 						],
 						"markdownDescription": "%github.copilot.config.virtualTools.threshold%"
+					},
+					"github.copilot.chat.azureAuthType": {
+						"type": "string",
+						"enum": [
+							"entraId",
+							"apiKey"
+						],
+						"enumDescriptions": [
+							"%github.copilot.config.azureAuthType.entraId%",
+							"%github.copilot.config.azureAuthType.apiKey%"
+						],
+						"default": "entraId",
+						"tags": [
+							"experimental"
+						],
+						"markdownDescription": "%github.copilot.config.azureAuthType%"
 					},
 					"github.copilot.chat.azureModels": {
 						"type": "object",
@@ -5266,7 +5284,7 @@
 		"@humanwhocodes/gitignore-to-minimatch": "1.0.2",
 		"@microsoft/tiktokenizer": "^1.0.10",
 		"@sinclair/typebox": "^0.34.41",
-		"@vscode/copilot-api": "^0.2.2",
+		"@vscode/copilot-api": "^0.2.3",
 		"@vscode/extension-telemetry": "^1.2.0",
 		"@vscode/l10n": "^0.0.18",
 		"@vscode/prompt-tsx": "^0.4.0-alpha.5",
