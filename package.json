@@ -3654,6 +3654,16 @@
 							"experimental"
 						]
 					},
+					"github.copilot.chat.inlineChat.selectionRatioThreshold": {
+						"type": "number",
+						"default": 0,
+						"markdownDescription": "%github.copilot.config.inlineChat.selectionRatioThreshold%",
+						"tags": [
+							"advanced",
+							"experimental",
+							"onExp"
+						]
+					},
 					"github.copilot.chat.temporalContext.maxAge": {
 						"type": "number",
 						"default": 100,
@@ -3915,7 +3925,7 @@
 					},
 					"github.copilot.chat.cli.isolation.enabled": {
 						"type": "boolean",
-						"default": false,
+						"default": true,
 						"markdownDescription": "%github.copilot.config.cli.isolation.enabled%",
 						"tags": [
 							"advanced",
