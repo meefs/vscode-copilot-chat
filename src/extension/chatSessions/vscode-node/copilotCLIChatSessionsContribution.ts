@@ -18,18 +18,18 @@ import { ITelemetryService } from '../../../platform/telemetry/common/telemetry'
 import { disposableTimeout } from '../../../util/vs/base/common/async';
 import { isCancellationError } from '../../../util/vs/base/common/errors';
 import { Emitter, Event } from '../../../util/vs/base/common/event';
-import { Disposable, DisposableStore, IDisposable, IReference } from '../../../util/vs/base/common/lifecycle';
+import { Disposable, DisposableStore, IDisposable, IReference, toDisposable } from '../../../util/vs/base/common/lifecycle';
 import { isEqual } from '../../../util/vs/base/common/resources';
 import { URI } from '../../../util/vs/base/common/uri';
 import { IInstantiationService } from '../../../util/vs/platform/instantiation/common/instantiation';
 import { ToolCall } from '../../agents/copilotcli/common/copilotCLITools';
+import { IChatDelegationSummaryService } from '../../agents/copilotcli/common/delegationSummaryService';
 import { COPILOT_CLI_DEFAULT_AGENT_ID, ICopilotCLIAgents, ICopilotCLIModels, ICopilotCLISDK } from '../../agents/copilotcli/node/copilotCli';
 import { CopilotCLIPromptResolver } from '../../agents/copilotcli/node/copilotcliPromptResolver';
 import { ICopilotCLISession } from '../../agents/copilotcli/node/copilotcliSession';
 import { ICopilotCLISessionItem, ICopilotCLISessionService } from '../../agents/copilotcli/node/copilotcliSessionService';
 import { PermissionRequest, requestPermission } from '../../agents/copilotcli/node/permissionHelpers';
 import { ChatVariablesCollection, isPromptFile } from '../../prompt/common/chatVariablesCollection';
-import { ChatSummarizerProvider } from '../../prompt/node/summarizer';
 import { IToolsService } from '../../tools/common/toolsService';
 import { ICopilotCLITerminalIntegration } from './copilotCLITerminalIntegration';
 import { CopilotCloudSessionsProvider } from './copilotCloudSessionsProvider';
@@ -53,6 +53,13 @@ interface CLIConfirmationMetadata {
 // When opening the session for readonly mode we store it here and when run the session we read from here instead of opening session in readonly mode again.
 const _sessionModel: Map<string, string | undefined> = new Map();
 
+// When we start an untitled CLI session, the id of the session is `untitled:xyz`
+// As soon as we create a CLI session we have the real session id, lets say `cli-1234`
+// Once the session completes, this untitled session `untitled:xyz` will get swapped with the real session id `cli-1234`
+// However if the session items provider is called while the session is still running, we need to return the same old `untitled:xyz` session id back to core.
+// There's an issue in core (about holding onto ref of the Chat Model).
+// As a temporary solution, return the same untitled session id back to core until the session is completed.
+const _untitledSessionIdMap = new Map<string, string>();
 function isUntitledSessionId(sessionId: string): boolean {
 	return sessionId.startsWith('untitled:');
 }
@@ -221,7 +228,7 @@ export class CopilotCLIChatSessionItemProvider extends Disposable implements vsc
 	}
 
 	private async _toChatSessionItem(session: ICopilotCLISessionItem): Promise<vscode.ChatSessionItem> {
-		const resource = SessionIdForCLI.getResource(session.id);
+		const resource = SessionIdForCLI.getResource(_untitledSessionIdMap.get(session.id) ?? session.id);
 		const worktreePath = this.worktreeManager.getWorktreePath(session.id);
 		const worktreeRelativePath = this.worktreeManager.getWorktreeRelativePath(session.id);
 
@@ -405,7 +412,6 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		private readonly promptResolver: CopilotCLIPromptResolver,
 		private readonly sessionItemProvider: CopilotCLIChatSessionItemProvider,
 		private readonly cloudSessionProvider: CopilotCloudSessionsProvider | undefined,
-		private readonly summarizer: ChatSummarizerProvider,
 		private readonly worktreeManager: CopilotCLIWorktreeManager,
 		@IGitService private readonly gitService: IGitService,
 		@ICopilotCLIModels private readonly copilotCLIModels: ICopilotCLIModels,
@@ -418,6 +424,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		@ICopilotCLISDK private readonly copilotCLISDK: ICopilotCLISDK,
 		@ILogService private readonly logService: ILogService,
 		@IPromptsService private readonly promptsService: IPromptsService,
+		@IChatDelegationSummaryService private readonly chatDelegationSummaryService: IChatDelegationSummaryService,
 	) {
 		super();
 	}
@@ -470,6 +477,8 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			}
 			this.copilotCLIAgents.trackSessionAgent(session.object.sessionId, agent?.name);
 			if (isUntitled) {
+				_untitledSessionIdMap.set(session.object.sessionId, id);
+				disposables.add(toDisposable(() => _untitledSessionIdMap.delete(session.object.sessionId)));
 				// The SDK doesn't save the session as no messages were added,
 				// If we dispose this here, then we will not be able to find this session later.
 				// So leave this session alive till it gets used using the `getSession` API later
@@ -494,6 +503,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 				// Delete old information stored for untitled session id.
 				_sessionModel.delete(id);
 				_sessionModel.set(session.object.sessionId, modelId);
+				_untitledSessionIdMap.delete(session.object.sessionId);
 				this.sessionItemProvider.swap(chatSessionContext.chatSessionItem, { resource: SessionIdForCLI.getResource(session.object.sessionId), label: request.prompt });
 			}
 			return {};
@@ -804,12 +814,13 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 
 		if (this.hasHistoryToSummarize(context.history)) {
 			stream.progress(vscode.l10n.t('Analyzing chat history'));
-			history = await this.summarizer.provideChatSummary(context, token);
+			history = await this.chatDelegationSummaryService.summarize(context, token);
+			history = history ? `**Summary**\n${history}` : undefined;
 		}
 
 		// Give priority to userPrompt if provided (e.g., from confirmation metadata)
 		userPrompt = userPrompt || request.prompt;
-		const requestPrompt = history ? `${userPrompt}\n**Summary**\n${history}` : userPrompt;
+		const requestPrompt = history ? `${userPrompt}\n${history}` : userPrompt;
 
 		// Create worktree if isolation is enabled and we don't have one yet
 		if (isolationEnabled && !workingDirectory) {
@@ -829,24 +840,35 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 
 		const session = await this.sessionService.createSession({ workingDirectory, isolationEnabled, agent, model }, token);
 		void this.copilotCLIAgents.trackSessionAgent(session.object.sessionId, agent?.name);
-
+		if (history) {
+			void this.chatDelegationSummaryService.trackSummaryUsage(session.object.sessionId, history);
+		}
 		// Do not await, we want this code path to be as fast as possible.
 		if (isolationEnabled && workingDirectory) {
 			void this.worktreeManager.storeWorktreePath(session.object.sessionId, workingDirectory.fsPath);
 		}
 
-		// We don't want to block the caller anymore.
-		// The caller is most likely a chat editor or the like.
-		// Now that we've delegated it to a session, we can get out of here.
-		// Else if the request takes say 10 minutes, the caller would be blocked for that long.
-		session.object.handleRequest(request.id, prompt, attachments, model, token)
-			.catch(error => {
-				this.logService.error(`Failed to handle CLI session request: ${error}`);
-				// Optionally: stream.error(error) to notify the user
-			})
-			.finally(() => {
-				session.dispose();
+		try {
+			this.sessionItemProvider.notifySessionsChange();
+			await vscode.commands.executeCommand('workbench.action.chat.openSessionWithPrompt.copilotcli', {
+				resource: SessionIdForCLI.getResource(session.object.sessionId),
+				prompt: requestPrompt
 			});
+		} catch {
+			// TODO@rebornix: handle potential missing command
+			// We don't want to block the caller anymore.
+			// The caller is most likely a chat editor or the like.
+			// Now that we've delegated it to a session, we can get out of here.
+			// Else if the request takes say 10 minutes, the caller would be blocked for that long.
+			session.object.handleRequest(request.id, prompt, attachments, model, token)
+				.catch(error => {
+					this.logService.error(`Failed to handle CLI session request: ${error}`);
+					// Optionally: stream.error(error) to notify the user
+				})
+				.finally(() => {
+					session.dispose();
+				});
+		}
 
 		stream.markdown(vscode.l10n.t('{0} agent has begun working on your request. Follow its progress in the Agents View.', 'Background Agent'));
 

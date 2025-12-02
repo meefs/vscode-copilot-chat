@@ -23,6 +23,7 @@ import { mock } from '../../../../util/common/test/simpleMock';
 import { CancellationTokenSource } from '../../../../util/vs/base/common/cancellation';
 import { DisposableStore } from '../../../../util/vs/base/common/lifecycle';
 import { IInstantiationService, ServicesAccessor } from '../../../../util/vs/platform/instantiation/common/instantiation';
+import { IChatDelegationSummaryService } from '../../../agents/copilotcli/common/delegationSummaryService';
 import { CopilotCLISDK, type ICopilotCLIModels, type ICopilotCLISDK } from '../../../agents/copilotcli/node/copilotCli';
 import { CopilotCLIPromptResolver } from '../../../agents/copilotcli/node/copilotcliPromptResolver';
 import { CopilotCLISession } from '../../../agents/copilotcli/node/copilotcliSession';
@@ -161,17 +162,39 @@ describe('CopilotCLIChatSessionParticipant.handleRequest', () => {
 				return undefined;
 			}
 		}();
+		const delegationService = new class extends mock<IChatDelegationSummaryService>() {
+			override async summarize(context: vscode.ChatContext, token: vscode.CancellationToken): Promise<string | undefined> {
+				return undefined;
+			}
+		}();
 		instantiationService = {
 			invokeFunction<R, TS extends any[] = []>(fn: (accessor: ServicesAccessor, ...args: TS) => R, ...args: TS): R {
 				return fn(accessor, ...args);
 			},
 			createInstance: (_ctor: unknown, options: any, sdkSession: any) => {
-				const session = new TestCopilotCLISession(options, sdkSession, gitService, logService, workspaceService, sdk, instantiationService);
+				const session = new TestCopilotCLISession(options, sdkSession, gitService, logService, workspaceService, sdk, instantiationService, delegationService);
 				cliSessions.push(session);
 				return disposables.add(session);
 			}
 		} as unknown as IInstantiationService;
-		sessionService = disposables.add(new CopilotCLISessionService(logService, sdk, instantiationService, new NullNativeEnvService(), new MockFileSystemService(), mcpHandler, new NullCopilotCLIAgents()));
+		const state: Record<string, unknown> = {};
+		const workspaceState: vscode.Memento = {
+			keys: () => Object.keys(state),
+			get: <T>(key: string, defaultValue?: T): T => {
+				if (key in state) {
+					return state[key] as T;
+				}
+				state[key] = defaultValue;
+				return defaultValue as T;
+			},
+			update: async (key: string, value: unknown) => {
+				state[key] = value;
+			}
+		};
+		const context: IVSCodeExtensionContext = new class extends mock<IVSCodeExtensionContext>() {
+			override workspaceState: vscode.Memento = workspaceState;
+		}();
+		sessionService = disposables.add(new CopilotCLISessionService(logService, sdk, instantiationService, new NullNativeEnvService(), new MockFileSystemService(), mcpHandler, new NullCopilotCLIAgents(), context, workspaceService));
 
 		manager = await sessionService.getSessionManager() as unknown as MockCliSdkSessionManager;
 
@@ -179,7 +202,6 @@ describe('CopilotCLIChatSessionParticipant.handleRequest', () => {
 			promptResolver,
 			itemProvider,
 			cloudProvider,
-			summarizer,
 			worktree,
 			git,
 			models,
@@ -191,7 +213,8 @@ describe('CopilotCLIChatSessionParticipant.handleRequest', () => {
 			configurationService,
 			copilotSDK,
 			logger,
-			new PromptsServiceImpl(new NullWorkspaceService())
+			new PromptsServiceImpl(new NullWorkspaceService()),
+			delegationService
 		);
 	});
 
