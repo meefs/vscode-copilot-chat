@@ -3819,15 +3819,6 @@
 							"experimental"
 						]
 					},
-					"github.copilot.chat.copilotCLI.enabled": {
-						"type": "boolean",
-						"default": true,
-						"markdownDescription": "%github.copilot.config.copilotCLI.enabled%",
-						"tags": [
-							"advanced",
-							"experimental"
-						]
-					},
 					"github.copilot.chat.gpt5AlternativePatch": {
 						"type": "boolean",
 						"default": false,
@@ -3894,15 +3885,6 @@
 						"type": "boolean",
 						"default": false,
 						"markdownDescription": "%github.copilot.config.suggestRelatedFilesFromGitHistory.useEmbeddings%",
-						"tags": [
-							"advanced",
-							"experimental"
-						]
-					},
-					"github.copilot.chat.cli.isolation.enabled": {
-						"type": "boolean",
-						"default": true,
-						"markdownDescription": "%github.copilot.config.cli.isolation.enabled%",
 						"tags": [
 							"advanced",
 							"experimental"
@@ -4966,7 +4948,7 @@
 				"icon": "$(collection)",
 				"welcomeTitle": "Background Agent",
 				"welcomeMessage": "Run tasks in the background",
-				"inputPlaceholder": "Describe your task, type `#` for adding context",
+				"inputPlaceholder": "Run tasks in the background, type `#` for adding context",
 				"order": 2,
 				"canDelegate": true,
 				"description": "Delegate tasks to a background agent.",
@@ -4995,7 +4977,7 @@
 				"icon": "$(cloud)",
 				"welcomeTitle": "Cloud Agent",
 				"welcomeMessage": "Delegate tasks to the cloud",
-				"inputPlaceholder": "Describe your task, type `#` for adding context",
+				"inputPlaceholder": "Delegate tasks to the cloud, type `#` for adding context",
 				"order": 1,
 				"canDelegate": true,
 				"description": "Delegate tasks to the GitHub Copilot Cloud Agent. The agent works asynchronously in the cloud to implement changes, iterates via chat, and can create or update pull requests as needed.",
