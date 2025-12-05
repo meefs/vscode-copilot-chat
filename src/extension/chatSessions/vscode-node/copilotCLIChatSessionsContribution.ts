@@ -9,6 +9,7 @@ import * as vscode from 'vscode';
 import { ChatExtendedRequestHandler, Uri } from 'vscode';
 import { IRunCommandExecutionService } from '../../../platform/commands/common/runCommandExecutionService';
 import { IVSCodeExtensionContext } from '../../../platform/extContext/common/extensionContext';
+import { IGitExtensionService } from '../../../platform/git/common/gitExtensionService';
 import { IGitService } from '../../../platform/git/common/gitService';
 import { toGitUri } from '../../../platform/git/common/utils';
 import { ILogService } from '../../../platform/log/common/logService';
@@ -18,7 +19,8 @@ import { disposableTimeout } from '../../../util/vs/base/common/async';
 import { isCancellationError } from '../../../util/vs/base/common/errors';
 import { Emitter, Event } from '../../../util/vs/base/common/event';
 import { Disposable, DisposableStore, IDisposable, IReference, toDisposable } from '../../../util/vs/base/common/lifecycle';
-import { isEqual } from '../../../util/vs/base/common/resources';
+import { ResourceMap } from '../../../util/vs/base/common/map';
+import { basename, isEqual } from '../../../util/vs/base/common/resources';
 import { URI } from '../../../util/vs/base/common/uri';
 import { IInstantiationService } from '../../../util/vs/platform/instantiation/common/instantiation';
 import { ToolCall } from '../../agents/copilotcli/common/copilotCLITools';
@@ -32,10 +34,28 @@ import { ChatVariablesCollection, isPromptFile } from '../../prompt/common/chatV
 import { IToolsService } from '../../tools/common/toolsService';
 import { ICopilotCLITerminalIntegration } from './copilotCLITerminalIntegration';
 import { CopilotCloudSessionsProvider } from './copilotCloudSessionsProvider';
+import { convertReferenceToVariable } from './copilotPromptReferences';
 
 const AGENTS_OPTION_ID = 'agent';
 const MODELS_OPTION_ID = 'model';
 const ISOLATION_OPTION_ID = 'isolation';
+
+const disabledIsolation: Readonly<vscode.ChatSessionProviderOptionItem> = {
+	id: 'disabled',
+	name: 'Workspace',
+	description: vscode.l10n.t('Use the current workspace for this session')
+};
+const disabledIsolationLocked: Readonly<vscode.ChatSessionProviderOptionItem> = { ...disabledIsolation, locked: true };
+
+function getLockedIsolationOption(name: string): vscode.ChatSessionProviderOptionItem {
+	return {
+		id: 'enabled',
+		name,
+		description: vscode.l10n.t('Using worktree for this session'),
+		locked: true,
+		icon: new vscode.ThemeIcon('git-branch')
+	};
+}
 
 const UncommittedChangesStep = 'uncommitted-changes';
 type ConfirmationResult = { step: string; accepted: boolean; metadata?: CLIConfirmationMetadata };
@@ -59,6 +79,11 @@ const _sessionModel: Map<string, string | undefined> = new Map();
 // There's an issue in core (about holding onto ref of the Chat Model).
 // As a temporary solution, return the same untitled session id back to core until the session is completed.
 const _untitledSessionIdMap = new Map<string, string>();
+
+// Right now it's expensive to get the sessions stats in some cases, specially for worktrees.
+// We should cache them until we get a new request
+const CachedSessionStats = new ResourceMap<vscode.ChatSessionChangedFile[]>();
+
 function isUntitledSessionId(sessionId: string): boolean {
 	return sessionId.startsWith('untitled:') || sessionId.startsWith('untitled-');
 }
@@ -89,7 +114,7 @@ export class CopilotCLIWorktreeManager {
 				const result = await this.tryCreateWorktree(progress);
 				resolve(result);
 				if (result) {
-					return vscode.l10n.t('Created isolated worktree at {0}', result);
+					return vscode.l10n.t('Created isolated worktree at {0}', basename(Uri.file(result)));
 				}
 				return undefined;
 			});
@@ -198,11 +223,13 @@ export class CopilotCLIChatSessionItemProvider extends Disposable implements vsc
 
 	private readonly _onDidCommitChatSessionItem = this._register(new Emitter<{ original: vscode.ChatSessionItem; modified: vscode.ChatSessionItem }>());
 	public readonly onDidCommitChatSessionItem: Event<{ original: vscode.ChatSessionItem; modified: vscode.ChatSessionItem }> = this._onDidCommitChatSessionItem.event;
+
 	constructor(
 		readonly worktreeManager: CopilotCLIWorktreeManager,
 		@ICopilotCLISessionService private readonly copilotcliSessionService: ICopilotCLISessionService,
 		@ICopilotCLITerminalIntegration private readonly terminalIntegration: ICopilotCLITerminalIntegration,
 		@IGitService private readonly gitService: IGitService,
+		@IGitExtensionService private readonly gitExtensionService: IGitExtensionService,
 		@IRunCommandExecutionService private readonly commandExecutionService: IRunCommandExecutionService,
 	) {
 		super();
@@ -213,6 +240,7 @@ export class CopilotCLIChatSessionItemProvider extends Disposable implements vsc
 	}
 
 	public notifySessionsChange(): void {
+		CachedSessionStats.clear();
 		this._onDidChangeChatSessionItems.fire();
 	}
 
@@ -238,9 +266,10 @@ export class CopilotCLIChatSessionItemProvider extends Disposable implements vsc
 		const label = session.label;
 		const tooltipLines = [vscode.l10n.t(`Background agent session: {0}`, label)];
 		let description: vscode.MarkdownString | undefined;
-		let statistics: { files: number; insertions: number; deletions: number } | undefined;
+		let changes: vscode.ChatSessionItem['changes'] | undefined;
 
 		if (worktreePath && worktreeRelativePath) {
+			const worktreeUri = Uri.file(worktreePath);
 			// Description
 			description = new vscode.MarkdownString(`$(list-tree) ${worktreeRelativePath}`);
 			description.supportThemeIcons = true;
@@ -249,7 +278,12 @@ export class CopilotCLIChatSessionItemProvider extends Disposable implements vsc
 			tooltipLines.push(vscode.l10n.t(`Worktree: {0}`, worktreeRelativePath));
 
 			// Statistics
-			statistics = await this.gitService.diffIndexWithHEADShortStats(Uri.file(worktreePath));
+			// Make sure the repository is opened
+			const stats = await this.getStatisticsForWorktree(worktreeUri);
+			if (stats && stats.length > 0) {
+				CachedSessionStats.set(resource, stats);
+				changes = stats;
+			}
 		}
 		const status = session.status ?? vscode.ChatSessionStatus.Completed;
 
@@ -259,9 +293,42 @@ export class CopilotCLIChatSessionItemProvider extends Disposable implements vsc
 			description,
 			tooltip: tooltipLines.join('\n'),
 			timing: session.timing,
-			statistics,
+			changes,
 			status
 		} satisfies vscode.ChatSessionItem;
+	}
+
+	private async getStatisticsForWorktree(worktreeUri: Uri) {
+		const repository = await this.gitService.getRepository(worktreeUri);
+		const details: vscode.ChatSessionChangedFile[] = [];
+		if (repository?.changes) {
+			const allChanges = [...repository.changes.indexChanges, ...repository.changes.workingTree];
+			const gitAPI = this.gitExtensionService.getExtensionApi();
+			const gitRepository = gitAPI?.getRepository(worktreeUri);
+
+			for (const change of allChanges) {
+				let insertions = 0;
+				let deletions = 0;
+
+				if (gitRepository && gitRepository.diffIndexWithHEADShortStats) {
+					try {
+						const fileStats = await gitRepository.diffIndexWithHEADShortStats(change.uri.fsPath);
+						if (fileStats) {
+							insertions = fileStats.insertions;
+							deletions = fileStats.deletions;
+						}
+					} catch (error) { }
+				}
+
+				details.push(new vscode.ChatSessionChangedFile(
+					change.uri,
+					insertions,
+					deletions,
+					change.originalUri,
+				));
+			}
+		}
+		return details;
 	}
 
 	public async createCopilotCLITerminal(): Promise<void> {
@@ -290,7 +357,7 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 		super();
 	}
 
-	public notifySessionOptionsChange(resource: vscode.Uri, updates: ReadonlyArray<{ optionId: string; value: string }>): void {
+	public notifySessionOptionsChange(resource: vscode.Uri, updates: ReadonlyArray<{ optionId: string; value: string | vscode.ChatSessionProviderOptionItem }>): void {
 		this._onDidChangeChatSessionOptions.fire({ resource, updates });
 	}
 
@@ -325,15 +392,14 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 			// For existing sessions with a worktree, show the worktree branch name as a locked option
 			const worktreeRelativePath = this.worktreeManager.getWorktreeRelativePath(copilotcliSessionId);
 			if (worktreeRelativePath) {
-				options[ISOLATION_OPTION_ID] = {
-					id: 'enabled',
-					name: worktreeRelativePath,
-					description: vscode.l10n.t('Using worktree for this session'),
-					locked: true,
-					icon: new vscode.ThemeIcon('git-branch')
-				};
+				options[ISOLATION_OPTION_ID] = getLockedIsolationOption(worktreeRelativePath);
+			} else {
+				options[ISOLATION_OPTION_ID] = disabledIsolationLocked;
 			}
+		} else if (existingSession) {
+			options[ISOLATION_OPTION_ID] = disabledIsolationLocked;
 		}
+
 		const history = existingSession?.object?.getChatHistory() || [];
 		existingSession?.dispose();
 		// Always keep track of this in memory.
@@ -351,7 +417,7 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 	async provideChatSessionProviderOptions(): Promise<vscode.ChatSessionProviderOptions> {
 		const isolationItems = [
 			{ id: 'enabled', name: 'Worktree', description: vscode.l10n.t('Use a git worktree for this session') },
-			{ id: 'disabled', name: 'Workspace', description: vscode.l10n.t('Use the current workspace for this session') }
+			disabledIsolation
 		];
 
 		const [models, agents] = await Promise.all([
@@ -364,7 +430,7 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 			{ id: COPILOT_CLI_DEFAULT_AGENT_ID, name: l10n.t('Agent') }
 		];
 		agents.forEach(agent => {
-			agentItems.push({ id: agent.name, name: agent.displayName || agent.description || agent.name });
+			agentItems.push({ id: agent.name, name: agent.displayName || agent.name, description: agent.description });
 		});
 
 		const options = {
@@ -451,6 +517,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 	private async handleRequest(request: vscode.ChatRequest, context: vscode.ChatContext, stream: vscode.ChatResponseStream, token: vscode.CancellationToken): Promise<vscode.ChatResult | void> {
 		const { chatSessionContext } = context;
 		const disposables = new DisposableStore();
+		let sessionResource: vscode.Uri | undefined;
 		try {
 
 			/* __GDPR__
@@ -478,6 +545,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 
 			const isUntitled = chatSessionContext.isUntitled;
 			const { resource } = chatSessionContext.chatSessionItem;
+			sessionResource = resource;
 			const id = SessionIdForCLI.parse(resource);
 			const additionalReferences = this.previousReferences.get(id) || [];
 			this.previousReferences.delete(id);
@@ -504,6 +572,20 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			if (!session || token.isCancellationRequested) {
 				return {};
 			}
+			if (isUntitled && session.object.options.isolationEnabled && session.object.options.workingDirectory && this.worktreeManager.isSupported()) {
+				const changes: { optionId: string; value: vscode.ChatSessionProviderOptionItem }[] = [];
+				// For existing sessions with a worktree, show the worktree branch name as a locked option
+				const worktreeRelativePath = this.worktreeManager.getWorktreeRelativePath(session.object.sessionId);
+				if (worktreeRelativePath) {
+					changes.push({ optionId: ISOLATION_OPTION_ID, value: getLockedIsolationOption(worktreeRelativePath) });
+					this.contentProvider.notifySessionOptionsChange(resource, changes);
+				}
+			} else if (isUntitled && (!session.object.options.isolationEnabled || !this.worktreeManager.isSupported())) {
+				const changes: { optionId: string; value: vscode.ChatSessionProviderOptionItem }[] = [];
+				changes.push({ optionId: ISOLATION_OPTION_ID, value: disabledIsolationLocked });
+				this.contentProvider.notifySessionOptionsChange(resource, changes);
+			}
+
 			this.copilotCLIAgents.trackSessionAgent(session.object.sessionId, agent?.name);
 			if (isUntitled) {
 				_untitledSessionIdMap.set(session.object.sessionId, id);
@@ -551,6 +633,11 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			throw ex;
 		}
 		finally {
+			// Clean cached references for this session
+			if (sessionResource) {
+				CachedSessionStats.delete(sessionResource);
+				this.sessionItemProvider.notifySessionsChange();
+			}
 			disposables.dispose();
 		}
 	}
@@ -850,7 +937,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 	private async createCLISessionAndSubmitRequest(
 		request: vscode.ChatRequest,
 		userPrompt: string | undefined,
-		references: readonly vscode.ChatPromptReference[] | undefined,
+		otherReferences: readonly vscode.ChatPromptReference[] | undefined,
 		context: vscode.ChatContext,
 		workingDirectory: Uri | undefined,
 		isolationEnabled: boolean,
@@ -883,8 +970,8 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			}
 		};
 
-		const [{ prompt, attachments }, model, agent] = await Promise.all([
-			requestPromptPromise.then(prompt => this.promptResolver.resolvePrompt(request, prompt, (references || []).concat([]), isolationEnabled, token)),
+		const [{ prompt, attachments, references }, model, agent] = await Promise.all([
+			requestPromptPromise.then(prompt => this.promptResolver.resolvePrompt(request, prompt, (otherReferences || []).concat([]), isolationEnabled, token)),
 			this.getModelId(undefined, request, true, token), // prefer model in request, as we're delegating from another session here.
 			this.getAgent(undefined, undefined, token),
 			getWorkingDirectory()
@@ -905,7 +992,8 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			this.sessionItemProvider.notifySessionsChange();
 			await vscode.commands.executeCommand('workbench.action.chat.openSessionWithPrompt.copilotcli', {
 				resource: SessionIdForCLI.getResource(session.object.sessionId),
-				prompt: userPrompt || request.prompt
+				prompt: userPrompt || request.prompt,
+				attachedContext: references.map(ref => convertReferenceToVariable(ref, attachments))
 			});
 		} catch {
 			this.contextForRequest.delete(session.object.sessionId);
@@ -924,7 +1012,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 				});
 		}
 
-		stream.markdown(vscode.l10n.t('{0} agent has begun working on your request. Follow its progress in the Agents View.', 'Background Agent'));
+		stream.markdown(vscode.l10n.t('{0} has begun working on your request. Follow its progress in the Agents View.', 'Background Agent'));
 
 		return {};
 	}
@@ -951,7 +1039,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		session.addUserMessage(userPrompt);
 
 		// Add assistant message event with embedded PR metadata
-		const assistantMessage = `GitHub Copilot cloud agent has begun working on your request. Follow its progress in the associated chat and pull request.\n<pr_metadata uri="${prInfo.uri.toString()}" title="${escapeXml(prInfo.title)}" description="${escapeXml(prInfo.description)}" author="${escapeXml(prInfo.author)}" linkTag="${escapeXml(prInfo.linkTag)}"/>`;
+		const assistantMessage = `Cloud Agent has begun working on your request. Follow its progress in the associated chat and pull request.\n<pr_metadata uri="${prInfo.uri.toString()}" title="${escapeXml(prInfo.title)}" description="${escapeXml(prInfo.description)}" author="${escapeXml(prInfo.author)}" linkTag="${escapeXml(prInfo.linkTag)}"/>`;
 		session.addUserAssistantMessage(assistantMessage);
 	}
 }
@@ -1049,12 +1137,17 @@ export function registerCLIChatCommands(copilotcliSessionItemProvider: CopilotCL
 
 		await vscode.commands.executeCommand('_workbench.openMultiDiffEditor', { multiDiffSourceUri, title, resources });
 	}));
-	disposableStore.add(vscode.commands.registerCommand('github.copilot.chat.applyCopilotCLIAgentSessionChanges', async (sessionItemResource?: vscode.Uri) => {
-		if (!sessionItemResource) {
+
+	const applyChanges = async (sessionItemOrResource?: vscode.ChatSessionItem | vscode.Uri) => {
+		const resource = sessionItemOrResource instanceof vscode.Uri
+			? sessionItemOrResource
+			: sessionItemOrResource?.resource;
+
+		if (!resource) {
 			return;
 		}
 
-		const sessionId = SessionIdForCLI.parse(sessionItemResource);
+		const sessionId = SessionIdForCLI.parse(resource);
 		const sessionWorktree = copilotcliSessionItemProvider.worktreeManager.getWorktreePath(sessionId);
 
 		if (!sessionWorktree) {
@@ -1073,6 +1166,11 @@ export function registerCLIChatCommands(copilotcliSessionItemProvider: CopilotCL
 			deleteFromSource: false,
 			untracked: true
 		});
-	}));
+
+		copilotcliSessionItemProvider.notifySessionsChange(); // pick up new git state
+	};
+
+	disposableStore.add(vscode.commands.registerCommand('github.copilot.chat.applyCopilotCLIAgentSessionChanges', applyChanges));
+	disposableStore.add(vscode.commands.registerCommand('github.copilot.chat.applyCopilotCLIAgentSessionChanges.apply', applyChanges));
 	return disposableStore;
 }
