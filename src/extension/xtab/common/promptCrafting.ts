@@ -129,6 +129,9 @@ function getPostScript(strategy: PromptingStrategy | undefined, currentFilePath:
 		case PromptingStrategy.XtabAggressiveness:
 			postScript = `<|aggressive|>${aggressivenessLevel}<|/aggressive|>`;
 			break;
+		case PromptingStrategy.PatchBased:
+			postScript = `Output a modified diff style format with the changes you want. Each change patch must start with \`<filename>:<line number>\` and then include some non empty "anchor lines" preceded by \`-\` and the new lines meant to replace them preceded by \`+\`. Put your changes in the order that makes the most sense, for example edits inside the code_to_edit region and near the user's <|cursor|> should always be prioritized. Output "<NO_EDIT>" if you don't have a good edit candidate.`;
+			break;
 		case PromptingStrategy.SimplifiedSystemPrompt:
 		case PromptingStrategy.CopilotNesXtab:
 		case undefined:
@@ -281,13 +284,17 @@ export function toUniquePath(documentId: DocumentId, workspaceRootPath: string |
 
 function formatCodeSnippet(
 	documentId: DocumentId,
-	fileContent: string,
-	truncate: boolean = false
+	lines: string[],
+	opts: { truncated: boolean; includeLineNumbers: boolean; startLineOffset: number },
 ): string {
 	const filePath = toUniquePath(documentId, undefined);
-	const firstLine = truncate
+	const firstLine = opts.truncated
 		? `code_snippet_file_path: ${filePath} (truncated)`
 		: `code_snippet_file_path: ${filePath}`;
+	const formattedLines = opts.includeLineNumbers
+		? lines.map((line, idx) => `${opts.startLineOffset + idx}| ${line}`)
+		: lines;
+	const fileContent = formattedLines.join('\n');
 	return [PromptTags.RECENT_FILE.start, firstLine, fileContent, PromptTags.RECENT_FILE.end].join('\n');
 }
 
@@ -355,7 +362,7 @@ function getRecentCodeSnippets(
 				}
 				const filePath = ctx.uri;
 				const documentId = DocumentId.create(filePath.toString());
-				const langCtxItemSnippet = formatCodeSnippet(documentId, ctx.value, false);
+				const langCtxItemSnippet = formatCodeSnippet(documentId, langCtxSnippet.split(/\r?\n/), { truncated: false, includeLineNumbers: opts.recentlyViewedDocuments.includeLineNumbers, startLineOffset: 0 });
 				snippets.push(langCtxItemSnippet);
 				tokenBudget = potentialBudget;
 			}
@@ -411,7 +418,7 @@ export function buildCodeSnippetsUsingPagedClipping(
 			if (linesToKeep.length > 0) {
 				const isTruncated = linesToKeep.length !== lines.length;
 				docsInPrompt.add(file.id);
-				snippets.push(formatCodeSnippet(file.id, linesToKeep.join('\n'), isTruncated));
+				snippets.push(formatCodeSnippet(file.id, linesToKeep, { truncated: isTruncated, includeLineNumbers: opts.recentlyViewedDocuments.includeLineNumbers, startLineOffset: 0 }));
 			}
 
 			maxTokenBudget = allowedBudget;
@@ -435,9 +442,10 @@ export function buildCodeSnippetsUsingPagedClipping(
 			if (budgetLeft === maxTokenBudget) {
 				break;
 			} else {
-				const linesToKeep = file.content.getLines().slice(firstPageIdx * pageSize, (lastPageIdxIncl + 1) * pageSize);
+				const startLineOffset = firstPageIdx * pageSize;
+				const linesToKeep = file.content.getLines().slice(startLineOffset, (lastPageIdxIncl + 1) * pageSize);
 				docsInPrompt.add(file.id);
-				snippets.push(formatCodeSnippet(file.id, linesToKeep.join('\n'), linesToKeep.length < lines.length));
+				snippets.push(formatCodeSnippet(file.id, linesToKeep, { truncated: linesToKeep.length < lines.length, includeLineNumbers: opts.recentlyViewedDocuments.includeLineNumbers, startLineOffset }));
 				maxTokenBudget = budgetLeft;
 			}
 		}
@@ -623,7 +631,7 @@ class ClippedDocument {
 
 export function createTaggedCurrentFileContentUsingPagedClipping(
 	currentDocLines: string[],
-	areaAroundCodeToEdit: string,
+	areaAroundCodeToEdit: string[],
 	areaAroundEditWindowLinesRange: OffsetRange,
 	computeTokens: (s: string) => number,
 	pageSize: number,
@@ -646,7 +654,7 @@ export function createTaggedCurrentFileContentUsingPagedClipping(
 
 	const taggedCurrentFileContent = [
 		...currentDocLines.slice(rangeToKeep.start, areaAroundEditWindowLinesRange.start),
-		areaAroundCodeToEdit,
+		...areaAroundCodeToEdit,
 		...currentDocLines.slice(areaAroundEditWindowLinesRange.endExclusive, rangeToKeep.endExclusive),
 	];
 
@@ -690,7 +698,7 @@ export function constructTaggedFile(
 		PromptTags.EDIT_WINDOW.end,
 		...contentWithCursorAsLines.slice(editWindowLinesRange.endExclusive, areaAroundEditWindowLinesRange.endExclusive),
 		PromptTags.AREA_AROUND.end
-	].join('\n');
+	];
 
 	const currentFileContentWithCursorLines = opts.includeLineNumbers.currentFileContent
 		? addLineNumbers(contentWithCursorAsLinesOriginal)
@@ -699,7 +707,7 @@ export function constructTaggedFile(
 		? addLineNumbers(currentDocument.lines)
 		: currentDocument.lines;
 
-	let areaAroundCodeToEditForCurrentFile: string;
+	let areaAroundCodeToEditForCurrentFile: string[];
 	if (promptOptions.currentFile.includeTags && opts.includeLineNumbers.currentFileContent === opts.includeLineNumbers.areaAroundCodeToEdit) {
 		areaAroundCodeToEditForCurrentFile = areaAroundCodeToEdit;
 	} else {
@@ -708,7 +716,7 @@ export function constructTaggedFile(
 			...currentFileContentWithCursorLines.slice(areaAroundEditWindowLinesRange.start, editWindowLinesRange.start),
 			...editWindowLines,
 			...currentFileContentWithCursorLines.slice(editWindowLinesRange.endExclusive, areaAroundEditWindowLinesRange.endExclusive),
-		].join('\n');
+		];
 	}
 
 	const taggedCurrentFileContentResult = createTaggedCurrentFileContentUsingPagedClipping(
@@ -722,6 +730,6 @@ export function constructTaggedFile(
 
 	return taggedCurrentFileContentResult.map(clippedTaggedCurrentDoc => ({
 		clippedTaggedCurrentDoc,
-		areaAroundCodeToEdit,
+		areaAroundCodeToEdit: areaAroundCodeToEdit.join('\n'),
 	}));
 }
