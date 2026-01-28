@@ -77,6 +77,8 @@ const listOfKnownRepos = new ResourceSet();
 
 const untrustedFolderMessage = l10n.t('The selected folder is not trusted. Please trust the folder to continue with the {0}.', 'Background Agent');
 
+let lastUsedFolderIdInUntitledWorkspace: string | undefined;
+
 export class CopilotCLISessionIsolationManager {
 	constructor(@IChatSessionWorktreeService private readonly worktreeManagerService: IChatSessionWorktreeService) { }
 
@@ -305,13 +307,13 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 				// For new untitled sessions in untitled workspaces, auto-select the first last-used repo if available
 				const lastUsedRepos = await this.getRepositoryOptionItemsForUntitledWorkspace();
 				if (lastUsedRepos.length > 0) {
-					const firstRepo = lastUsedRepos[0];
-					options[REPOSITORY_OPTION_ID] = firstRepo.id;
-					if (listOfKnownRepos.has(URI.file(firstRepo.id))) {
-						await this.copilotCLIWorktreeManagerService.setSessionRepository(copilotcliSessionId, firstRepo.id);
+					const firstRepo = (lastUsedFolderIdInUntitledWorkspace && lastUsedRepos.find(repo => repo.id === lastUsedFolderIdInUntitledWorkspace)?.id) ?? lastUsedRepos[0].id;
+					options[REPOSITORY_OPTION_ID] = firstRepo;
+					if (listOfKnownRepos.has(URI.file(firstRepo))) {
+						await this.copilotCLIWorktreeManagerService.setSessionRepository(copilotcliSessionId, firstRepo);
 						await this.workspaceFolderService.deleteTrackedWorkspaceFolder(copilotcliSessionId);
 					} else {
-						await this.workspaceFolderService.trackSessionWorkspaceFolder(copilotcliSessionId, firstRepo.id);
+						await this.workspaceFolderService.trackSessionWorkspaceFolder(copilotcliSessionId, firstRepo);
 						await this.copilotCLIWorktreeManagerService.deleteSessionRepository(copilotcliSessionId);
 					}
 				}
@@ -569,6 +571,9 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 					await this.selectAgentModel(resource, agent, token);
 				}
 			} else if (update.optionId === REPOSITORY_OPTION_ID && typeof update.value === 'string') {
+				if (this.isUntitledWorkspace()) {
+					lastUsedFolderIdInUntitledWorkspace = update.value;
+				}
 				// Track based on whether selection is a git repo or workspace folder without git
 				if (await this.isWorkspaceFolderWithoutRepo(URI.file(update.value))) {
 					await Promise.all([
@@ -906,7 +911,11 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		const id = existingSessionId ?? SessionIdForCLI.parse(resource);
 		const isNewSession = chatSessionContext.isUntitled && !existingSessionId;
 
-		const { isolationEnabled, workingDirectory, worktreeProperties } = await this.getOrInitializeWorkingDirectory(chatSessionContext, uncommitedChangesAction, stream, token);
+		const { isolationEnabled, workingDirectory, worktreeProperties, cancelled } = await this.getOrInitializeWorkingDirectory(chatSessionContext, uncommitedChangesAction, stream, token);
+		if (cancelled || token.isCancellationRequested) {
+			return undefined;
+		}
+
 		const session = isNewSession ?
 			await this.sessionService.createSession({ model, workingDirectory, isolationEnabled, agent }, token) :
 			await this.sessionService.getSession(id, { model, workingDirectory, isolationEnabled, readonly: false, agent }, token);
@@ -1111,6 +1120,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		isolationEnabled: boolean;
 		workingDirectory: Uri | undefined;
 		worktreeProperties: ChatSessionWorktreeProperties | undefined;
+		cancelled: boolean;
 	}> {
 		const createWorkingTreeIfRequired = async (sessionId: string | undefined) => {
 			// Check if the session has a workspace folder tracked (folder without git repo)
@@ -1131,10 +1141,10 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 					const isTrusted = await this.workspaceService.requestResourceTrust({ uri: sessionWorkspaceFolder, message: untrustedFolderMessage });
 					if (!isTrusted) {
 						stream.warning(l10n.t('The selected folder is not trusted.'));
-						return { workingDirectory: undefined, worktreeProperties: undefined, isWorkspaceFolderWithoutRepo: true };
+						return { workingDirectory: undefined, worktreeProperties: undefined, isWorkspaceFolderWithoutRepo: true, cancelled: true };
 					}
 					// Workspace folder without git repo - no worktree can be created, use folder directly
-					return { workingDirectory: sessionWorkspaceFolder, worktreeProperties: undefined, isWorkspaceFolderWithoutRepo: true };
+					return { workingDirectory: sessionWorkspaceFolder, worktreeProperties: undefined, isWorkspaceFolderWithoutRepo: true, cancelled: false };
 				}
 			}
 
@@ -1146,21 +1156,21 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 				const isTrusted = await this.workspaceService.requestResourceTrust({ uri: selectedRepository.rootUri, message: untrustedFolderMessage });
 				if (!isTrusted) {
 					stream.warning(l10n.t('The selected folder is not trusted.'));
-					return { workingDirectory: undefined, worktreeProperties: undefined, isWorkspaceFolderWithoutRepo: true };
+					return { workingDirectory: undefined, worktreeProperties: undefined, isWorkspaceFolderWithoutRepo: true, cancelled: true };
 				}
 			}
 
 			if (!selectedRepository) {
-				return { workingDirectory, worktreeProperties: undefined, isWorkspaceFolderWithoutRepo: false };
+				return { workingDirectory, worktreeProperties: undefined, isWorkspaceFolderWithoutRepo: false, cancelled: false };
 			}
 
 
 			const worktreeProperties = await this.copilotCLIWorktreeManagerService.createWorktree(sessionId, stream);
 			if (worktreeProperties) {
-				return { workingDirectory: Uri.file(worktreeProperties.worktreePath), worktreeProperties, isWorkspaceFolderWithoutRepo: false };
+				return { workingDirectory: Uri.file(worktreeProperties.worktreePath), worktreeProperties, isWorkspaceFolderWithoutRepo: false, cancelled: false };
 			} else {
 				stream.warning(l10n.t('Failed to create worktree. Proceeding without isolation.'));
-				return { workingDirectory, worktreeProperties: undefined, isWorkspaceFolderWithoutRepo: false };
+				return { workingDirectory, worktreeProperties: undefined, isWorkspaceFolderWithoutRepo: false, cancelled: false };
 			}
 		};
 
@@ -1168,6 +1178,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		let worktreeProperties: Awaited<ReturnType<IChatSessionWorktreeService['createWorktree']>> | undefined;
 		let isolationEnabled = true;
 		let isWorkspaceFolderWithoutRepo = false;
+		let cancelled = false;
 
 		if (chatSessionContext) {
 			const existingSessionId = this.untitledSessionIdMapping.get(SessionIdForCLI.parse(chatSessionContext.chatSessionItem.resource));
@@ -1175,7 +1186,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			const isNewSession = chatSessionContext.isUntitled && !existingSessionId;
 
 			if (isNewSession) {
-				({ workingDirectory, worktreeProperties, isWorkspaceFolderWithoutRepo } = await createWorkingTreeIfRequired(id));
+				({ workingDirectory, worktreeProperties, isWorkspaceFolderWithoutRepo, cancelled } = await createWorkingTreeIfRequired(id));
 				// Means we failed to create worktree or this is a workspace folder without git repo
 				if (!worktreeProperties) {
 					isolationEnabled = false;
@@ -1191,7 +1202,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 				}
 			}
 		} else {
-			({ workingDirectory, worktreeProperties, isWorkspaceFolderWithoutRepo } = await createWorkingTreeIfRequired(undefined));
+			({ workingDirectory, worktreeProperties, isWorkspaceFolderWithoutRepo, cancelled } = await createWorkingTreeIfRequired(undefined));
 			// Means we failed to create worktree or this is a workspace folder without git repo
 			if (!worktreeProperties) {
 				isolationEnabled = false;
@@ -1204,7 +1215,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		}
 
 		// If we failed to create a worktree or isolation is disabled, then isolation is false
-		return { isolationEnabled, workingDirectory, worktreeProperties };
+		return { isolationEnabled, workingDirectory, worktreeProperties, cancelled };
 	}
 
 	private async moveOrCopyChangesToWorkTree(
@@ -1278,11 +1289,15 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			return summary ? `${userPrompt}\n${summary}` : userPrompt;
 		})();
 
-		const [{ isolationEnabled, workingDirectory, worktreeProperties }, model, agent] = await Promise.all([
+		const [{ isolationEnabled, workingDirectory, worktreeProperties, cancelled }, model, agent] = await Promise.all([
 			this.getOrInitializeWorkingDirectory(undefined, uncommittedChangesAction, stream, token),
 			this.getModelId(undefined, request, true, token), // prefer model in request, as we're delegating from another session here.
 			this.getAgent(undefined, undefined, token)
 		]);
+
+		if (cancelled || token.isCancellationRequested) {
+			return {};
+		}
 
 		const { prompt, attachments, references } = await this.promptResolver.resolvePrompt(request, await requestPromptPromise, (otherReferences || []).concat([]), isolationEnabled, workingDirectory, token);
 
