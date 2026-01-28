@@ -4209,7 +4209,7 @@
 					},
 					"github.copilot.chat.cli.mcp.enabled": {
 						"type": "boolean",
-						"default": true,
+						"default": false,
 						"markdownDescription": "%github.copilot.config.cli.mcp.enabled%",
 						"tags": [
 							"advanced",
@@ -5303,7 +5303,7 @@
 				"type": "claude-code",
 				"name": "claude",
 				"displayName": "Claude Agent",
-				"icon": "$(sparkle)",
+				"icon": "$(code)",
 				"welcomeTitle": "Claude Agent",
 				"welcomeMessage": "Powered by the same agent as Claude Code",
 				"inputPlaceholder": "Run local tasks with Claude, type `#` for adding context",
