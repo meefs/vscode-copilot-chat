@@ -72,8 +72,8 @@ interface UserSelectedRepository {
 }
 
 // TODO: No API from GH yet.
-const HARDCODED_PARTNER_AGENTS: { id: string; name: string; at?: string; assignableActorLogin?: string }[] = [
-	{ id: DEFAULT_PARTNER_AGENT_ID, name: 'Copilot', assignableActorLogin: 'copilot-swe-agent' },
+const HARDCODED_PARTNER_AGENTS: { id: string; name: string; at?: string; assignableActorLogin?: string; codiconId?: string }[] = [
+	{ id: DEFAULT_PARTNER_AGENT_ID, name: 'Copilot', assignableActorLogin: 'copilot-swe-agent', codiconId: 'copilot' },
 	{ id: '2246796', name: 'Claude', at: 'claude[agent]', assignableActorLogin: 'anthropic-code-agent' },
 	{ id: '2248422', name: 'Codex', at: 'codex[agent]', assignableActorLogin: 'openai-code-agent' }
 ];
@@ -529,7 +529,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 	 * Queries for available partner agents by checking if known CCA logins are assignable in the repository.
 	 * TODO: Remove once given a proper API
 	 */
-	private async getAvailablePartnerAgents(owner: string, repo: string): Promise<{ id: string; name: string; at?: string }[]> {
+	private async getAvailablePartnerAgents(owner: string, repo: string): Promise<{ id: string; name: string; at?: string; codiconId?: string }[]> {
 		const cacheKey = `${owner}/${repo}`;
 
 		// Return cached result if available
@@ -542,7 +542,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 			const assignableActors = await this._octoKitService.getAssignableActors(owner, repo, { createIfNone: false });
 
 			// Check which agents from HARDCODED_PARTNER_AGENTS are assignable
-			const availableAgents: { id: string; name: string; at?: string }[] = [];
+			const availableAgents: { id: string; name: string; at?: string; codiconId?: string }[] = [];
 
 			for (const agent of HARDCODED_PARTNER_AGENTS) {
 				const { assignableActorLogin } = agent;
@@ -646,7 +646,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 		try {
 			// Fetch agents (requires repo), models (global), and partner agents in parallel
 			const [customAgents, models, partnerAgents] = await Promise.allSettled([
-				repoId ? this._octoKitService.getCustomAgents(repoId.org, repoId.repo, { excludeInvalidConfig: true }, { createIfNone: false }) : Promise.resolve([]),
+				repoId && repoIds?.length === 1 ? this._octoKitService.getCustomAgents(repoId.org, repoId.repo, { excludeInvalidConfig: true }, { createIfNone: false }) : Promise.resolve([]),
 				this._octoKitService.getCopilotAgentModels({ createIfNone: false }),
 				repoId ? this.getAvailablePartnerAgents(repoId.org, repoId.repo) : Promise.resolve([])
 			]);
@@ -659,7 +659,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 					id: agent.id,
 					name: agent.name,
 					...(agent.id === DEFAULT_PARTNER_AGENT_ID && { default: true }),
-					icon: new vscode.ThemeIcon('agent')
+					icon: agent.codiconId ? new vscode.ThemeIcon(agent.codiconId) : undefined
 				}));
 				optionGroups.push({
 					id: PARTNER_AGENTS_OPTION_GROUP_ID,
@@ -674,7 +674,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 				customAgents.status === 'fulfilled' ? customAgents.value : []
 			);
 
-			if ((customAgents.status === 'fulfilled' && customAgents.value.length > 0) || localOnly.length > 0) {
+			if ((customAgents.status === 'fulfilled' && customAgents.value.length > 0) || (repoIds?.length === 1 && localOnly.length > 0)) {
 				const agentItems: vscode.ChatSessionProviderOptionItem[] = [
 					{
 						id: DEFAULT_CUSTOM_AGENT_ID,
