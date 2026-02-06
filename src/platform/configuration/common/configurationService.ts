@@ -839,6 +839,8 @@ export namespace ConfigKey {
 		export const RecordExpectedEditEnabled = defineTeamInternalSetting<boolean>('chat.advanced.inlineEdits.recordExpectedEdit.enabled', ConfigType.Simple, false);
 		export const RecordExpectedEditOnReject = defineTeamInternalSetting<boolean>('chat.advanced.inlineEdits.recordExpectedEdit.onReject', ConfigType.Simple, false);
 
+		export const ReadFileCodeFences = defineTeamInternalSetting<boolean>('chat.advanced.readFileCodeFences', ConfigType.ExperimentBased, false);
+
 		// TODO: @sandy081 - These should be moved away from this namespace
 		export const EnableReadFileV2 = defineSetting<boolean>('chat.advanced.enableReadFileV2', ConfigType.ExperimentBased, isPreRelease);
 		export const AskAgent = defineSetting<boolean>('chat.advanced.enableAskAgent', ConfigType.ExperimentBased, false);
@@ -959,6 +961,7 @@ export namespace ConfigKey {
 
 	export const BackgroundAgentEnabled = defineSetting<boolean>('chat.backgroundAgent.enabled', ConfigType.Simple, true);
 	export const CloudAgentEnabled = defineSetting<boolean>('chat.cloudAgent.enabled', ConfigType.Simple, true);
+	export const AdditionalReadAccessPaths = defineSetting<string[]>('chat.additionalReadAccessPaths', ConfigType.Simple, []);
 	export const AskQuestionsEnabled = defineSetting<boolean>('chat.askQuestions.enabled', ConfigType.Simple, true);
 	export const SwitchAgentEnabled = defineSetting<boolean>('chat.switchAgent.enabled', ConfigType.Simple, false);
 

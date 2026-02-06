@@ -6,71 +6,32 @@
 import { PermissionMode } from '@anthropic-ai/claude-agent-sdk';
 import * as l10n from '@vscode/l10n';
 import * as vscode from 'vscode';
+import { ChatExtendedRequestHandler } from 'vscode';
 import { ConfigKey, IConfigurationService } from '../../../platform/configuration/common/configurationService';
-import { coalesce } from '../../../util/vs/base/common/arrays';
 import { CancellationToken } from '../../../util/vs/base/common/cancellation';
 import { Emitter } from '../../../util/vs/base/common/event';
 import { Disposable } from '../../../util/vs/base/common/lifecycle';
-import { ChatRequestTurn2 } from '../../../vscodeTypes';
-import { completeToolInvocation, createFormattedToolInvocation } from '../../agents/claude/common/toolInvocationFormatter';
+import { ClaudeAgentManager } from '../../agents/claude/node/claudeCodeAgent';
 import { IClaudeCodeModels, NoClaudeModelsAvailableError } from '../../agents/claude/node/claudeCodeModels';
 import { IClaudeSessionStateService } from '../../agents/claude/node/claudeSessionStateService';
 import { IClaudeCodeSessionService } from '../../agents/claude/node/sessionParser/claudeCodeSessionService';
-import { AssistantMessageContent, ContentBlock, IClaudeCodeSession, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock } from '../../agents/claude/node/sessionParser/claudeSessionSchema';
-import { ClaudeSessionUri } from './claudeChatSessionItemProvider';
+import { IClaudeCodeSession } from '../../agents/claude/node/sessionParser/claudeSessionSchema';
+import { IClaudeSlashCommandService } from '../../agents/claude/vscode-node/claudeSlashCommandService';
+
+// Import the tool permission handlers
+import '../../agents/claude/vscode-node/toolPermissionHandlers/index';
+
+// Import the hooks to trigger self-registration
+import '../../agents/claude/vscode-node/hooks/index';
+
+import { buildChatHistory } from './chatHistoryBuilder';
+import { ClaudeChatSessionItemProvider, ClaudeSessionUri } from './claudeChatSessionItemProvider';
 
 const MODELS_OPTION_ID = 'model';
 const PERMISSION_MODE_OPTION_ID = 'permissionMode';
 
 /** Sentinel value indicating no Claude models with Messages API are available */
 export const UNAVAILABLE_MODEL_ID = '__unavailable__';
-
-interface ToolContext {
-	unprocessedToolCalls: Map<string, ContentBlock>;
-	pendingToolInvocations: Map<string, vscode.ChatToolInvocationPart>;
-}
-
-// #region Helpers
-
-/**
- * Checks if a text block contains a system-reminder tag.
- * System-reminders are stored in separate content blocks and should not be rendered.
- */
-function isSystemReminderBlock(text: string): boolean {
-	return text.includes('<system-reminder>');
-}
-
-/**
- * Strips <system-reminder> tags and their content from a string.
- * Used for backwards compatibility with legacy sessions where system-reminders
- * were concatenated with user text in a single string.
- *
- * TODO: Remove this function after a few releases (added in 0.38.x) once legacy
- * sessions with concatenated system-reminders are no longer common.
- */
-function stripSystemReminders(text: string): string {
-	return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, '');
-}
-
-// #endregion
-
-// #region Type Guards
-function isTextBlock(block: ContentBlock): block is TextBlock {
-	return block.type === 'text';
-}
-
-function isThinkingBlock(block: ContentBlock): block is ThinkingBlock {
-	return block.type === 'thinking';
-}
-
-function isToolUseBlock(block: ContentBlock): block is ToolUseBlock {
-	return block.type === 'tool_use';
-}
-
-function isToolResultBlock(block: ContentBlock): block is ToolResultBlock {
-	return block.type === 'tool_result';
-}
-// #endregion
 
 export class ClaudeChatSessionContentProvider extends Disposable implements vscode.ChatSessionContentProvider {
 	private readonly _onDidChangeChatSessionOptions = this._register(new Emitter<vscode.ChatSessionOptionChangeEvent>());
@@ -87,6 +48,7 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 		@IClaudeCodeModels private readonly claudeCodeModels: IClaudeCodeModels,
 		@IClaudeSessionStateService private readonly sessionStateService: IClaudeSessionStateService,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
+		@IClaudeSlashCommandService private readonly slashCommandService: IClaudeSlashCommandService,
 	) {
 		super();
 
@@ -125,6 +87,7 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 
 	public override dispose(): void {
 		this._lastKnownOptions.clear();
+		this._untitledToSdkSession.clear();
 		super.dispose();
 	}
 
@@ -152,6 +115,83 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 	public getPermissionModeForSession(sessionId: string): PermissionMode {
 		return this.sessionStateService.getPermissionModeForSession(sessionId);
 	}
+
+	// #region Chat Participant Handler
+
+	// Track SDK session IDs for untitled sessions that haven't been swapped yet.
+	// When VS Code yields mid-request, we can't swap yet (no complete session to display),
+	// so we store the SDK session ID to reuse on the next request.
+	private readonly _untitledToSdkSession = new Map<string, string>();
+
+	createHandler(
+		sessionType: string,
+		claudeAgentManager: ClaudeAgentManager,
+		sessionItemProvider: ClaudeChatSessionItemProvider,
+	): ChatExtendedRequestHandler {
+		return async (request: vscode.ChatRequest, context: vscode.ChatContext, stream: vscode.ChatResponseStream, token: vscode.CancellationToken): Promise<vscode.ChatResult | void> => {
+			const { chatSessionContext } = context;
+			if (!chatSessionContext) {
+				/* Via @claude */
+				// TODO: Think about how this should work
+				stream.markdown(vscode.l10n.t("Start a new Claude Agent session"));
+				stream.button({ command: `workbench.action.chat.openNewSessionEditor.${sessionType}`, title: vscode.l10n.t("Start Session") });
+				return {};
+			}
+
+			// Try to handle as a slash command first
+			const slashResult = await this.slashCommandService.tryHandleCommand(request.prompt, stream, token);
+			if (slashResult.handled) {
+				return slashResult.result ?? {};
+			}
+
+			const sessionId = ClaudeSessionUri.getId(chatSessionContext.chatSessionItem.resource);
+			let modelId: string;
+			try {
+				modelId = await this.getModelIdForSession(sessionId);
+			} catch (e) {
+				if (e instanceof NoClaudeModelsAvailableError) {
+					return { errorDetails: { message: e.message } };
+				}
+				throw e;
+			}
+			const permissionMode = this.getPermissionModeForSession(sessionId);
+			const yieldRequested = () => context.yieldRequested;
+
+			// For untitled sessions, check if we have a stored SDK session from a previous yield
+			const untitledKey = chatSessionContext.isUntitled ? chatSessionContext.chatSessionItem.resource.toString() : undefined;
+			const effectiveSessionId = chatSessionContext.isUntitled
+				? this._untitledToSdkSession.get(untitledKey!)
+				: sessionId;
+
+			const result = await claudeAgentManager.handleRequest(effectiveSessionId, request, context, stream, token, modelId, permissionMode, yieldRequested);
+
+			if (chatSessionContext.isUntitled) {
+				if (result.claudeSessionId) {
+					if (context.yieldRequested) {
+						// VS Code will follow up immediately - store the SDK session so the
+						// next request reuses it instead of creating a new one
+						this._untitledToSdkSession.set(untitledKey!, result.claudeSessionId);
+					} else {
+						// Done yielding (or never yielded) - swap to persistent session
+						this._untitledToSdkSession.delete(untitledKey!);
+						const swapResource = ClaudeSessionUri.forSessionId(result.claudeSessionId);
+						await this.sessionService.waitForSessionReady(swapResource, token);
+						sessionItemProvider.swap(chatSessionContext.chatSessionItem, {
+							resource: swapResource,
+							label: request.prompt ?? 'Claude Agent'
+						});
+					}
+				} else if (!result.errorDetails) {
+					// Only show generic warning if we didn't already show a specific error
+					stream.warning(vscode.l10n.t("Failed to create a new Claude Agent session."));
+				}
+			}
+
+			return result.errorDetails ? { errorDetails: result.errorDetails } : {};
+		};
+	}
+
+	// #endregion
 
 	async provideChatSessionProviderOptions(): Promise<vscode.ChatSessionProviderOptions> {
 		const models = await this.claudeCodeModels.getModels();
@@ -224,9 +264,8 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 	async provideChatSessionContent(sessionResource: vscode.Uri, token: vscode.CancellationToken): Promise<vscode.ChatSession> {
 		const sessionId = ClaudeSessionUri.getId(sessionResource);
 		const existingSession = await this.sessionService.getSession(sessionResource, token);
-		const toolContext = this._createToolContext();
 		const history = existingSession ?
-			this._buildChatHistory(existingSession, toolContext) :
+			buildChatHistory(existingSession) :
 			[];
 
 		let model: string | undefined;
@@ -254,155 +293,6 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 			requestHandler: undefined,
 			options,
 		};
-	}
-
-	private _buildChatHistory(existingSession: IClaudeCodeSession | undefined, toolContext: ToolContext): (vscode.ChatRequestTurn2 | vscode.ChatResponseTurn2)[] {
-		if (!existingSession) {
-			return [];
-		}
-
-		// Group consecutive messages of the same type into single turns.
-		// The JSONL format stores each API turn as multiple lines, but VS Code's
-		// chat API expects alternating request/response turns.
-		const result: (vscode.ChatRequestTurn2 | vscode.ChatResponseTurn2)[] = [];
-		let i = 0;
-		const messages = existingSession.messages;
-
-		while (i < messages.length) {
-			const currentType = messages[i].type;
-
-			if (currentType === 'user') {
-				// Collect all consecutive user messages
-				const userContents: (string | ContentBlock[])[] = [];
-				while (i < messages.length && messages[i].type === 'user' && messages[i].message.role === 'user') {
-					userContents.push(messages[i].message.content as string | ContentBlock[]);
-					i++;
-				}
-				const requestTurn = this._userMessagesToRequest(userContents, toolContext);
-				if (requestTurn) {
-					result.push(requestTurn);
-				}
-			} else if (currentType === 'assistant') {
-				// Collect all consecutive assistant messages
-				const assistantMessages: AssistantMessageContent[] = [];
-				while (i < messages.length && messages[i].type === 'assistant' && messages[i].message.role === 'assistant') {
-					assistantMessages.push(messages[i].message as AssistantMessageContent);
-					i++;
-				}
-				const responseTurn = this._assistantMessagesToResponse(assistantMessages, toolContext);
-				result.push(responseTurn);
-			} else {
-				// Skip unknown message types
-				i++;
-			}
-		}
-
-		return result;
-	}
-
-	/**
-	 * Converts multiple consecutive user messages into a single request turn.
-	 */
-	private _userMessagesToRequest(contents: (string | ContentBlock[])[], toolContext: ToolContext): vscode.ChatRequestTurn2 | undefined {
-		// Process tool results from all messages
-		for (const content of contents) {
-			this._processToolResults(content, toolContext);
-		}
-
-		// Extract and combine text content from all messages
-		const textParts: string[] = [];
-		for (const content of contents) {
-			const text = this._extractTextContent(content);
-			if (text.trim()) {
-				textParts.push(text);
-			}
-		}
-
-		const combinedText = textParts.join('\n\n');
-
-		// If no visible text, don't create a request turn
-		if (!combinedText.trim()) {
-			return;
-		}
-
-		// If the message indicates it was interrupted, skip it
-		if (combinedText === '[Request interrupted by user]') {
-			return;
-		}
-
-		return new ChatRequestTurn2(combinedText, undefined, [], '', [], undefined, undefined);
-	}
-
-	/**
-	 * Converts multiple consecutive assistant messages into a single response turn.
-	 */
-	private _assistantMessagesToResponse(messages: AssistantMessageContent[], toolContext: ToolContext): vscode.ChatResponseTurn2 {
-		const allParts: (vscode.ChatResponseMarkdownPart | vscode.ChatResponseThinkingProgressPart | vscode.ChatToolInvocationPart)[] = [];
-
-		for (const message of messages) {
-			const parts = coalesce(message.content.map(block => {
-				if (isTextBlock(block)) {
-					return new vscode.ChatResponseMarkdownPart(new vscode.MarkdownString(block.text));
-				} else if (isThinkingBlock(block)) {
-					return new vscode.ChatResponseThinkingProgressPart(block.thinking);
-				} else if (isToolUseBlock(block)) {
-					toolContext.unprocessedToolCalls.set(block.id, block);
-					const toolInvocation = createFormattedToolInvocation(block);
-					if (toolInvocation) {
-						toolContext.pendingToolInvocations.set(block.id, toolInvocation);
-					}
-					return toolInvocation;
-				}
-			}));
-			allParts.push(...parts);
-		}
-
-		return new vscode.ChatResponseTurn2(allParts, {}, '');
-	}
-
-	private _createToolContext(): ToolContext {
-		return {
-			unprocessedToolCalls: new Map(),
-			pendingToolInvocations: new Map()
-		};
-	}
-
-	private _extractTextContent(content: string | ContentBlock[]): string {
-		if (typeof content === 'string') {
-			// TODO: Remove this branch when stripSystemReminders is removed (legacy compat)
-			return stripSystemReminders(content);
-		}
-
-		// For array content (new format), filter out entire blocks that are system-reminders
-		return content
-			.filter(isTextBlock)
-			.filter(block => !isSystemReminderBlock(block.text))
-			.map(block => block.text)
-			.join('');
-	}
-
-	private _processToolResults(content: string | ContentBlock[], toolContext: ToolContext): void {
-		if (typeof content === 'string') {
-			return;
-		}
-
-		for (const block of content) {
-			if (isToolResultBlock(block)) {
-				const toolUse = toolContext.unprocessedToolCalls.get(block.tool_use_id);
-				if (toolUse && isToolUseBlock(toolUse)) {
-					toolContext.unprocessedToolCalls.delete(block.tool_use_id);
-					const pendingInvocation = toolContext.pendingToolInvocations.get(block.tool_use_id);
-					if (pendingInvocation) {
-						pendingInvocation.isComplete = true;
-						pendingInvocation.isConfirmed = true;
-						pendingInvocation.isError = block.is_error;
-						// Populate tool output for display in chat UI
-						completeToolInvocation(toolUse, block, pendingInvocation);
-						toolContext.pendingToolInvocations.delete(block.tool_use_id);
-					}
-				}
-			}
-		}
 	}
 
 	/**

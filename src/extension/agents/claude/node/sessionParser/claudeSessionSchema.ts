@@ -211,7 +211,7 @@ export type CacheCreation = ValidatorType<typeof vCacheCreation>;
  * Token usage information for API calls.
  */
 export const vUsage = vObj({
-	cache_creation: vCacheCreation,
+	cache_creation: vNullable(vCacheCreation),
 	cache_creation_input_tokens: vNumber(),
 	cache_read_input_tokens: vNumber(),
 	input_tokens: vNumber(),
@@ -246,6 +246,12 @@ export const vAssistantMessageContent = vObj({
 	usage: vUsage,
 });
 export type AssistantMessageContent = ValidatorType<typeof vAssistantMessageContent>;
+
+/**
+ * Model ID used by the SDK for synthetic messages (e.g., "No response requested." from abort).
+ * These messages should be filtered out from display and processing.
+ */
+export const SYNTHETIC_MODEL_ID = '<synthetic>';
 
 // #endregion
 

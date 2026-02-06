@@ -105,6 +105,18 @@ export interface IClaudeCodeSessionService {
 	 * Get parse statistics from the last session load (for debugging).
 	 */
 	getLastParseStats(): ParseStats | undefined;
+
+	/**
+	 * Polls until the session's JSONL file contains a complete session
+	 * (i.e., the last message is from the assistant). This is necessary because
+	 * the CLI child process may not have flushed the JSONL to disk by the time
+	 * the parent process receives the result message via stdout.
+	 *
+	 * TODO: Is there a better way to do this? There seems to be a race condition
+	 * between Claude returning to us and it writing to disk. This could be removed
+	 * if Claude SDK gives us a way to list sessions.
+	 */
+	waitForSessionReady(resource: URI, token: CancellationToken): Promise<void>;
 }
 
 // #endregion
@@ -119,7 +131,8 @@ export class ClaudeCodeSessionService implements IClaudeCodeSessionService {
 	private _metadataFileMtimes = new ResourceMap<number>();
 
 	// Full session cache for getSession (keyed by session resource URI)
-	private _fullSessionCache = new ResourceMap<IClaudeCodeSession>();
+	// Stores the session along with the source file URI and mtime for freshness checking
+	private _fullSessionCache = new ResourceMap<{ session: IClaudeCodeSession; fileUri: URI; mtime: number }>();
 
 	// Track session directories for subagent detection
 	private _sessionDirs = new ResourceMap<Set<string>>();
@@ -169,10 +182,18 @@ export class ClaudeCodeSessionService implements IClaudeCodeSessionService {
 	 * Get a specific session with full content by its resource URI.
 	 */
 	async getSession(resource: URI, token: CancellationToken): Promise<IClaudeCodeSession | undefined> {
-		// Check full session cache first
+		// Check full session cache with mtime-based freshness
 		const cached = this._fullSessionCache.get(resource);
 		if (cached !== undefined) {
-			return cached;
+			try {
+				const stat = await this._fileSystem.stat(cached.fileUri);
+				if (stat.mtime <= cached.mtime) {
+					return cached.session;
+				}
+			} catch {
+				// File gone or error — fall through to reload
+			}
+			this._fullSessionCache.delete(resource);
 		}
 
 		const targetId = resource.path.slice(1); // Remove leading '/' from path
@@ -186,9 +207,11 @@ export class ClaudeCodeSessionService implements IClaudeCodeSessionService {
 			const projectDirUri = URI.joinPath(this._nativeEnvService.userHome, '.claude', 'projects', slug);
 			const sessionFileUri = URI.joinPath(projectDirUri, `${targetId}.jsonl`);
 
-			// Check if this file exists
+			// Check if this file exists and capture mtime for cache freshness
+			let fileMtime: number;
 			try {
-				await this._fileSystem.stat(sessionFileUri);
+				const stat = await this._fileSystem.stat(sessionFileUri);
+				fileMtime = stat.mtime;
 			} catch {
 				continue; // File doesn't exist in this project dir
 			}
@@ -196,7 +219,7 @@ export class ClaudeCodeSessionService implements IClaudeCodeSessionService {
 			// Load and parse the full session
 			const session = await this._loadFullSession(targetId, projectDirUri, token);
 			if (session !== undefined) {
-				this._fullSessionCache.set(resource, session);
+				this._fullSessionCache.set(resource, { session, fileUri: sessionFileUri, mtime: fileMtime });
 				return session;
 			}
 		}
@@ -216,6 +239,23 @@ export class ClaudeCodeSessionService implements IClaudeCodeSessionService {
 	 */
 	getLastParseStats(): ParseStats | undefined {
 		return this._lastParseStats;
+	}
+
+	async waitForSessionReady(resource: URI, token: CancellationToken): Promise<void> {
+		const maxAttempts = 20; // 20 × 100ms = 2s max wait
+		for (let attempt = 0; attempt < maxAttempts; attempt++) {
+			if (token.isCancellationRequested) {
+				return;
+			}
+			const session = await this.getSession(resource, token);
+			if (session && session.messages.length > 0) {
+				const lastMsg = session.messages[session.messages.length - 1];
+				if (lastMsg.type === 'assistant') {
+					return;
+				}
+			}
+			await new Promise<void>(resolve => setTimeout(resolve, 100));
+		}
 	}
 
 	// #region Directory Discovery
