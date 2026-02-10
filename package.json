@@ -2293,6 +2293,18 @@
 				"category": "Copilot CLI"
 			},
 			{
+				"command": "github.copilot.cli.newSession",
+				"title": "%github.copilot.command.cli.newSession%",
+				"icon": "$(terminal)",
+				"category": "Chat"
+			},
+			{
+				"command": "github.copilot.cli.newSessionToSide",
+				"title": "%github.copilot.command.cli.newSessionToSide%",
+				"icon": "$(terminal)",
+				"category": "Chat"
+			},
+			{
 				"command": "github.copilot.chat.replay",
 				"title": "Start Chat Replay",
 				"icon": "$(debug-line-by-line)",
@@ -2836,6 +2848,7 @@
 			{
 				"command": "github.copilot.chat.copilotCLI.addFileReference",
 				"title": "%github.copilot.command.chat.copilotCLI.addFileReference%",
+				"enablement": "config.github.copilot.chat.cli.integration.enabled",
 				"category": "Copilot CLI"
 			},
 			{
@@ -4563,7 +4576,7 @@
 				{
 					"command": "github.copilot.chat.copilotCLI.addFileReference",
 					"group": "copilot",
-					"when": "!inOutput && resourceScheme != 'vscode-webview' && resourceScheme != 'webview-panel'"
+					"when": "config.github.copilot.chat.cli.integration.enabled && !inOutput && resourceScheme != 'vscode-webview' && resourceScheme != 'webview-panel'"
 				}
 			],
 			"editor/context/chat": [
@@ -5382,7 +5395,7 @@
 				"command": "github.copilot.chat.copilotCLI.addFileReference",
 				"key": "ctrl+shift+.",
 				"mac": "cmd+shift+.",
-				"when": "editorTextFocus"
+				"when": "config.github.copilot.chat.cli.integration.enabled && editorTextFocus"
 			},
 			{
 				"command": "github.copilot.chat.rerunWithCopilotDebug",
@@ -5594,7 +5607,8 @@
 				"when": "config.github.copilot.chat.claudeAgent.enabled",
 				"canDelegate": true,
 				"capabilities": {
-					"supportsFileAttachments": true
+					"supportsFileAttachments": true,
+					"supportsImageAttachments": true
 				},
 				"commands": [
 					{
