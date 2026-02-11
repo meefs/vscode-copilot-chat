@@ -2323,6 +2323,10 @@
 				"enablement": "github.copilot.chat.replay.workspaceEditTracing"
 			},
 			{
+				"command": "github.copilot.chat.compact",
+				"title": "%github.copilot.command.compactConversation%"
+			},
+			{
 				"command": "github.copilot.chat.explain",
 				"title": "%github.copilot.command.explainThis%",
 				"enablement": "!github.copilot.interactiveSession.disabled",
@@ -2848,6 +2852,12 @@
 			{
 				"command": "github.copilot.chat.copilotCLI.addFileReference",
 				"title": "%github.copilot.command.chat.copilotCLI.addFileReference%",
+				"enablement": "github.copilot.chat.copilotCLI.hasSession",
+				"category": "Copilot CLI"
+			},
+			{
+				"command": "github.copilot.chat.copilotCLI.addSelection",
+				"title": "%github.copilot.command.chat.copilotCLI.addSelection%",
 				"enablement": "github.copilot.chat.copilotCLI.hasSession",
 				"category": "Copilot CLI"
 			},
@@ -4600,6 +4610,11 @@
 					"command": "github.copilot.chat.copilotCLI.addFileReference",
 					"group": "copilot",
 					"when": "github.copilot.chat.copilotCLI.hasSession && !inOutput && resourceScheme != 'vscode-webview' && resourceScheme != 'webview-panel'"
+				},
+				{
+					"command": "github.copilot.chat.copilotCLI.addSelection",
+					"group": "copilot",
+					"when": "github.copilot.chat.copilotCLI.hasSession && editorHasSelection && !inOutput && resourceScheme != 'vscode-webview' && resourceScheme != 'webview-panel'"
 				}
 			],
 			"editor/context/chat": [
@@ -4646,6 +4661,11 @@
 					"command": "github.copilot.chat.checkoutPullRequestReroute",
 					"when": "chatSessionType == copilot-cloud-agent && !github.vscode-pull-request-github.activated && gitOpenRepositoryCount != 0",
 					"group": "navigation@0"
+				}
+			],
+			"chat/contextUsage/actions": [
+				{
+					"command": "github.copilot.chat.compact"
 				}
 			],
 			"chat/newSession": [
@@ -5916,7 +5936,7 @@
 		"zod": "3.25.76"
 	},
 	"dependencies": {
-		"@anthropic-ai/claude-agent-sdk": "0.2.37",
+		"@anthropic-ai/claude-agent-sdk": "^0.2.39",
 		"@anthropic-ai/sdk": "^0.74.0",
 		"@github/blackbird-external-ingest-utils": "^0.2.0",
 		"@github/copilot": "^0.0.406",
