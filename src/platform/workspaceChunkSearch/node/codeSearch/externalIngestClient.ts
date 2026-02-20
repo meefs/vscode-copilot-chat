@@ -91,11 +91,13 @@ export class ExternalIngestClient extends Disposable implements IExternalIngestC
 	}
 
 	public canIngestPathAndSize(filePath: string, size: number): boolean {
-		return canIngestPathAndSize(this._ingestFilter, filePath, size);
+		const result = canIngestPathAndSize(this._ingestFilter, filePath, size);
+		return typeof result.failureReason === 'undefined';
 	}
 
 	public canIngestDocument(filePath: string, data: Uint8Array): boolean {
-		return canIngestDocument(this._ingestFilter, filePath, new DocumentContents(data));
+		const result = canIngestDocument(this._ingestFilter, filePath, new DocumentContents(data));
+		return typeof result.failureReason === 'undefined';
 	}
 
 	private getHeaders(authToken: string): Record<string, string> {
@@ -210,7 +212,7 @@ export class ExternalIngestClient extends Disposable implements IExternalIngestC
 		try {
 			createIngestResponse = await createIngest();
 		} catch (err) {
-			throw new Error('Exception during create ingest', err);
+			throw new Error(`Exception during create ingest: ${err}`);
 		}
 
 		// Handle 429 by cleaning up old filesets and retrying
@@ -226,7 +228,7 @@ export class ExternalIngestClient extends Disposable implements IExternalIngestC
 			try {
 				createIngestResponse = await createIngest();
 			} catch (err) {
-				throw new Error('Exception during create ingest retry', err);
+				throw new Error(`Exception during create ingest retry: ${err}`);
 			}
 
 			// If we still get 429 after cleanup and retry, fail with a clear error
@@ -293,9 +295,9 @@ export class ExternalIngestClient extends Disposable implements IExternalIngestC
 				);
 				const body = await raceCancellationError(pushCodedSymbolsResponse.json(), token) as { next_coded_symbol_range?: CodedSymbolRange };
 				codedSymbolRange = body.next_coded_symbol_range;
-			} catch (e) {
+			} catch (err) {
 				this.logService.error(`ExternalIngestClient::updateIndex(): Failed to push coded symbols: ${pushCodedSymbolsResponse?.statusText} - ${await pushCodedSymbolsResponse?.text()}`);
-				throw new Error('Exception during push coded symbols');
+				throw new Error(`Exception during push coded symbols: ${err}`);
 			}
 		}
 
