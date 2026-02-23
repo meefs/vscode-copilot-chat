@@ -511,7 +511,7 @@
 			{
 				"name": "copilot_getProjectSetupInfo",
 				"displayName": "%github.copilot.tools.getProjectSetupInfo.name%",
-				"when": "config.github.copilot.chat.newWorkspaceCreation.enabled",
+				"when": "config.github.copilot.chat.newWorkspaceCreation.enabled && !config.github.copilot.chat.projectSetupInfoSkill.enabled",
 				"toolReferenceName": "getProjectSetupInfo",
 				"legacyToolReferenceFullNames": [
 					"new/getProjectSetupInfo"
@@ -1012,7 +1012,8 @@
 				"displayName": "%github.copilot.tools.searchResults.name%",
 				"icon": "$(search)",
 				"userDescription": "%github.copilot.tools.searchResults.description%",
-				"modelDescription": "The results from the search view"
+				"modelDescription": "The results from the search view",
+				"when": "!config.github.copilot.chat.getSearchViewResultsSkill.enabled"
 			},
 			{
 				"name": "copilot_githubRepo",
@@ -1230,7 +1231,6 @@
 					"newWorkspace",
 					"openIntegratedBrowser",
 					"runCommand",
-					"askQuestions",
 					"switchAgent",
 					"vscodeAPI"
 				]
@@ -2350,18 +2350,6 @@
 				"category": "Chat"
 			},
 			{
-				"command": "github.copilot.chat.generateDocs",
-				"title": "%github.copilot.command.generateDocs%",
-				"enablement": "!github.copilot.interactiveSession.disabled && !editorReadonly",
-				"category": "Chat"
-			},
-			{
-				"command": "github.copilot.chat.generateTests",
-				"title": "%github.copilot.command.generateTests%",
-				"enablement": "!github.copilot.interactiveSession.disabled && !editorReadonly",
-				"category": "Chat"
-			},
-			{
 				"command": "github.copilot.chat.fix",
 				"title": "%github.copilot.command.fixThis%",
 				"enablement": "!github.copilot.interactiveSession.disabled && !editorReadonly",
@@ -3179,6 +3167,15 @@
 			{
 				"id": "experimental",
 				"properties": {
+					"github.copilot.chat.getSearchViewResultsSkill.enabled": {
+						"type": "boolean",
+						"default": false,
+						"description": "%github.copilot.config.getSearchViewResultsSkill.enabled%",
+						"tags": [
+							"experimental",
+							"onExp"
+						]
+					},
 					"github.copilot.chat.githubMcpServer.enabled": {
 						"type": "boolean",
 						"default": false,
@@ -3214,15 +3211,6 @@
 						"markdownDescription": "%github.copilot.config.githubMcpServer.lockdown%",
 						"tags": [
 							"experimental"
-						]
-					},
-					"github.copilot.chat.askQuestions.enabled": {
-						"type": "boolean",
-						"default": true,
-						"markdownDescription": "%github.copilot.config.askQuestions.enabled%",
-						"tags": [
-							"experimental",
-							"onExp"
 						]
 					},
 					"github.copilot.chat.switchAgent.enabled": {
@@ -3503,14 +3491,6 @@
 								}
 							]
 						],
-						"tags": [
-							"experimental"
-						]
-					},
-					"github.copilot.chat.generateTests.codeLens": {
-						"type": "boolean",
-						"default": false,
-						"description": "%github.copilot.config.generateTests.codeLens%",
 						"tags": [
 							"experimental"
 						]
@@ -3884,6 +3864,16 @@
 							"onExp"
 						],
 						"description": "%github.copilot.config.installExtensionSkill.enabled%"
+					},
+					"github.copilot.chat.projectSetupInfoSkill.enabled": {
+						"type": "boolean",
+						"default": false,
+						"tags": [
+							"advanced",
+							"experimental",
+							"onExp"
+						],
+						"description": "%github.copilot.config.projectSetupInfoSkill.enabled%"
 					},
 					"github.copilot.chat.debug.overrideChatEngine": {
 						"type": [
@@ -4518,9 +4508,19 @@
 			],
 			"editor/context": [
 				{
+					"command": "github.copilot.chat.fix",
+					"when": "!github.copilot.interactiveSession.disabled && !editorReadonly && editorSelectionHasDiagnostics",
+					"group": "1_chat@4"
+				},
+				{
 					"command": "github.copilot.chat.explain",
 					"when": "!github.copilot.interactiveSession.disabled",
-					"group": "1_chat@4"
+					"group": "1_chat@5"
+				},
+				{
+					"command": "github.copilot.chat.review",
+					"when": "config.github.copilot.chat.reviewSelection.enabled && !github.copilot.interactiveSession.disabled && resourceScheme != 'vscode-chat-code-block'",
+					"group": "1_chat@6"
 				},
 				{
 					"command": "github.copilot.chat.copilotCLI.addFileReference",
@@ -4531,28 +4531,6 @@
 					"command": "github.copilot.chat.copilotCLI.addSelection",
 					"group": "copilot",
 					"when": "github.copilot.chat.copilotCLI.hasSession && editorHasSelection && !inOutput && resourceScheme != 'vscode-webview' && resourceScheme != 'webview-panel'"
-				}
-			],
-			"editor/context/chat": [
-				{
-					"command": "github.copilot.chat.fix",
-					"when": "!github.copilot.interactiveSession.disabled && !editorReadonly",
-					"group": "copilotAction@1"
-				},
-				{
-					"command": "github.copilot.chat.review",
-					"when": "config.github.copilot.chat.reviewSelection.enabled && !github.copilot.interactiveSession.disabled && resourceScheme != 'vscode-chat-code-block'",
-					"group": "copilotAction@2"
-				},
-				{
-					"command": "github.copilot.chat.generateDocs",
-					"when": "!github.copilot.interactiveSession.disabled && !editorReadonly",
-					"group": "copilotGenerate@1"
-				},
-				{
-					"command": "github.copilot.chat.generateTests",
-					"when": "!github.copilot.interactiveSession.disabled && !editorReadonly",
-					"group": "copilotGenerate@2"
 				}
 			],
 			"chat/editor/inlineGutter": [
@@ -5742,8 +5720,20 @@
 		],
 		"chatSkills": [
 			{
+				"path": "./assets/prompts/skills/project-setup-info-local/SKILL.md",
+				"when": "config.github.copilot.chat.projectSetupInfoSkill.enabled && !config.github.copilot.chat.newWorkspace.useContext7"
+			},
+			{
+				"path": "./assets/prompts/skills/project-setup-info-context7/SKILL.md",
+				"when": "config.github.copilot.chat.projectSetupInfoSkill.enabled && config.github.copilot.chat.newWorkspace.useContext7"
+			},
+			{
 				"path": "./assets/prompts/skills/install-vscode-extension/SKILL.md",
 				"when": "config.github.copilot.chat.installExtensionSkill.enabled && config.github.copilot.chat.newWorkspaceCreation.enabled"
+			},
+			{
+				"path": "./assets/prompts/skills/get-search-view-results/SKILL.md",
+				"when": "config.github.copilot.chat.getSearchViewResultsSkill.enabled"
 			}
 		],
 		"terminal": {
