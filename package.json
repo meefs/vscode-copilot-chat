@@ -4876,6 +4876,11 @@
 					"group": "export@1"
 				},
 				{
+					"command": "workbench.action.chat.openAgentDebugPanel",
+					"when": "view == copilot-chat",
+					"group": "3_show@0"
+				},
+				{
 					"command": "github.copilot.debug.showOutputChannel",
 					"when": "view == copilot-chat",
 					"group": "3_show@1"
@@ -5649,6 +5654,10 @@
 						"name": "delegate",
 						"description": "Delegate chat session to cloud agent and create associated PR",
 						"when": "config.github.copilot.chat.cloudAgent.enabled"
+					},
+					{
+						"name": "compact",
+						"description": "%github.copilot.command.cli.compact.description%"
 					}
 				],
 				"customAgentTarget": "github-copilot",
