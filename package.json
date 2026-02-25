@@ -90,7 +90,7 @@
 	"l10n": "./l10n",
 	"enabledApiProposals": [
 		"agentSessionsWorkspace",
-		"chatDebug@1",
+		"chatDebug@2",
 		"chatHooks@6",
 		"extensionsAny",
 		"newSymbolNamesProvider",
@@ -1700,6 +1700,11 @@
 			{
 				"vendor": "copilotcli",
 				"displayName": "Copilot CLI",
+				"when": "false"
+			},
+			{
+				"vendor": "claude-code",
+				"displayName": "Claude Code",
 				"when": "false"
 			},
 			{
@@ -4310,6 +4315,27 @@
 							"onExp"
 						]
 					},
+					"github.copilot.nextEditSuggestions.aggressiveness": {
+						"type": "string",
+						"default": "default",
+						"enum": [
+							"default",
+							"low",
+							"medium",
+							"high"
+						],
+						"enumDescriptions": [
+							"%github.copilot.config.nextEditSuggestions.aggressiveness.default%",
+							"%github.copilot.config.nextEditSuggestions.aggressiveness.low%",
+							"%github.copilot.config.nextEditSuggestions.aggressiveness.medium%",
+							"%github.copilot.config.nextEditSuggestions.aggressiveness.high%"
+						],
+						"markdownDescription": "%github.copilot.config.nextEditSuggestions.aggressiveness%",
+						"tags": [
+							"advanced",
+							"experimental"
+						]
+					},
 					"github.copilot.chat.cli.customAgents.enabled": {
 						"type": "boolean",
 						"default": true,
@@ -5564,6 +5590,7 @@
 				"description": "%github.copilot.session.providerDescription.claude%",
 				"when": "config.github.copilot.chat.claudeAgent.enabled && !github.copilot.previewFeaturesDisabled",
 				"canDelegate": true,
+				"requiresCustomModels": true,
 				"capabilities": {
 					"supportsFileAttachments": true,
 					"supportsImageAttachments": true
@@ -5700,7 +5727,7 @@
 				"path": "./assets/prompts/create-prompt.prompt.md"
 			},
 			{
-				"path": "./assets/prompts/create-instruction.prompt.md"
+				"path": "./assets/prompts/create-instructions.prompt.md"
 			},
 			{
 				"path": "./assets/prompts/create-skill.prompt.md"
@@ -5926,5 +5953,5 @@
 		"node-gyp": "npm:node-gyp@10.3.1",
 		"zod": "3.25.76"
 	},
-	"vscodeCommit": "0fb77198a80fee9a92acf843d8cb7c2e7205a46f"
+	"vscodeCommit": "37d89378138178bd2847f275082f1875f17c1f4a"
 }
