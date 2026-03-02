@@ -232,18 +232,24 @@ export class CopilotCLIChatSessionItemProvider extends Disposable implements vsc
 			if (worktreeProperties?.repositoryPath) {
 				// Worktree
 				const repositoryPathUri = vscode.Uri.file(worktreeProperties.repositoryPath);
-				badge = new vscode.MarkdownString(`$(repo) ${basename(repositoryPathUri)}`);
+				const isTrusted = await vscode.workspace.isResourceTrusted(repositoryPathUri);
+				const badgeIcon = isTrusted ? '$(repo)' : '$(workspace-untrusted)';
+
+				badge = new vscode.MarkdownString(`${badgeIcon} ${basename(repositoryPathUri)}`);
 				badge.supportThemeIcons = true;
 			} else if (workingDirectory) {
 				// Workspace
-				badge = new vscode.MarkdownString(`$(folder) ${basename(workingDirectory)}`);
+				const isTrusted = await vscode.workspace.isResourceTrusted(workingDirectory);
+				const badgeIcon = isTrusted ? '$(folder)' : '$(workspace-untrusted)';
+
+				badge = new vscode.MarkdownString(`${badgeIcon} ${basename(workingDirectory)}`);
 				badge.supportThemeIcons = true;
 			}
 		}
 
-		// Statistics
+		// Statistics (only returned for trusted workspace/worktree folders)
 		const changes: vscode.ChatSessionChangedFile2[] = [];
-		if (worktreeProperties) {
+		if (worktreeProperties?.repositoryPath && await vscode.workspace.isResourceTrusted(vscode.Uri.file(worktreeProperties.repositoryPath))) {
 			// Worktree
 			const worktreeChanges = await this.worktreeManager.getWorktreeChanges(session.id) ?? [];
 			this.logService.trace(`[CLISessionItemProvider ${session.id}] Worktree changes for session: ${worktreeChanges.length} file(s)`);
@@ -713,6 +719,13 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 		let triggerProviderOptionsChange = false;
 		for (const update of updates) {
 			if (update.optionId === AGENTS_OPTION_ID) {
+				const currentValue = await this.copilotCLIAgents.getSessionAgent(sessionId);
+				if (!currentValue && !update.value) {
+					continue;
+				}
+				if (typeof currentValue === 'string' && currentValue === update.value) {
+					continue;
+				}
 				void this.copilotCLIAgents.setDefaultAgent(update.value);
 				void this.copilotCLIAgents.trackSessionAgent(sessionId, update.value);
 			} else if (update.optionId === REPOSITORY_OPTION_ID && typeof update.value === 'string' && isUntitledSessionId(sessionId)) {
@@ -775,8 +788,14 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 					this._selectedRepoForBranches = undefined;
 				}
 			} else if (update.optionId === BRANCH_OPTION_ID) {
+				if (typeof update.value === 'string' && update.value === _sessionBranch.get(sessionId)) {
+					continue;
+				}
 				_sessionBranch.set(sessionId, update.value);
 			} else if (update.optionId === ISOLATION_OPTION_ID) {
+				if (typeof update.value === 'string' && update.value === _sessionIsolation.get(sessionId)) {
+					continue;
+				}
 				_sessionIsolation.set(sessionId, update.value);
 				triggerProviderOptionsChange = true;
 
