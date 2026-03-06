@@ -357,14 +357,9 @@ export abstract class ToolCallingLoop<TOptions extends IToolCallingLoopOptions =
 			return undefined;
 		}
 
-		// safety valves
+		// safety valve — only give up after exhausting all continuation attempts
 		if (this.autopilotIterationCount >= ToolCallingLoop.MAX_AUTOPILOT_ITERATIONS) {
 			this._logService.info(`[ToolCallingLoop] Autopilot: hit max iterations (${ToolCallingLoop.MAX_AUTOPILOT_ITERATIONS}), letting it stop`);
-			return undefined;
-		}
-
-		// we already nudged and the model still stopped — just let it go
-		if (this.autopilotStopHookActive) {
 			return undefined;
 		}
 
@@ -378,6 +373,8 @@ export abstract class ToolCallingLoop<TOptions extends IToolCallingLoopOptions =
 			'- You have open questions or ambiguities — make good decisions and keep working\n' +
 			'- You encountered an error — try to resolve it or find an alternative approach\n' +
 			'- There are remaining steps — complete them first\n\n' +
+			'When you ARE done, first provide a brief text summary of what was accomplished, then call task_complete. ' +
+			'Both the summary message and the tool call are required.\n\n' +
 			'Keep working autonomously until the task is truly finished, then call task_complete.';
 	}
 
@@ -764,9 +761,12 @@ export abstract class ToolCallingLoop<TOptions extends IToolCallingLoopOptions =
 				}
 			}
 
-			// Check if VS Code has requested we gracefully yield before starting the next iteration
+			// Check if VS Code has requested we gracefully yield before starting the next iteration.
+			// In autopilot mode, don't yield until the task is actually complete.
 			if (lastResult && this.options.yieldRequested?.()) {
-				break;
+				if (this.options.request.permissionLevel !== 'autopilot' || this.taskCompleted) {
+					break;
+				}
 			}
 
 			try {
@@ -784,10 +784,11 @@ export abstract class ToolCallingLoop<TOptions extends IToolCallingLoopOptions =
 				this.toolCallRounds.push(result.round);
 				this._sessionTranscriptService.logAssistantTurnEnd(sessionId, turnId);
 
-				// If we previously nudged the model and it produced productive (non-task_complete)
-				// tool calls, reset the flag so it can be nudged again next time it stops.
+				// If the model produced productive (non-task_complete) tool calls after being nudged,
+				// reset the stop hook flag and iteration count so it can be nudged again.
 				if (this.autopilotStopHookActive && result.round.toolCalls.length && !result.round.toolCalls.some(tc => tc.name === ToolCallingLoop.TASK_COMPLETE_TOOL_NAME)) {
 					this.autopilotStopHookActive = false;
+					this.autopilotIterationCount = 0;
 				}
 
 				if (!result.round.toolCalls.length || result.response.type !== ChatFetchResponseType.Success) {

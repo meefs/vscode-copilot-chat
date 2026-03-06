@@ -221,6 +221,21 @@ export abstract class AbstractConfigurationService extends Disposable implements
 		if (ConfigValueValidators.isCustomTeamDefaultValue(key.defaultValue)) {
 			return this._isTeamMember ? key.defaultValue.teamDefaultValue : key.defaultValue.defaultValue;
 		}
+
+		const defaultValueFromConfig = this.getDefaultValueForConfig(key);
+
+		// Preserve legacy behavior for settings whose code default is undefined.
+		// VS Code may return type-default sentinels (false/0/''/null/undefined) from inspect().defaultValue,
+		// which should not override an intentional undefined default in code.
+		const isTypeDefaultSentinel = defaultValueFromConfig === undefined || defaultValueFromConfig === null || defaultValueFromConfig === false || defaultValueFromConfig === 0 || defaultValueFromConfig === '';
+		if (key.defaultValue === undefined && isTypeDefaultSentinel) {
+			return key.defaultValue;
+		}
+
+		if (defaultValueFromConfig !== undefined) {
+			return defaultValueFromConfig;
+		}
+
 		return key.defaultValue;
 	}
 
@@ -316,6 +331,10 @@ export abstract class AbstractConfigurationService extends Disposable implements
 			|| inspect?.workspaceLanguageValue !== undefined
 		);
 		return isConfigured;
+	}
+
+	protected getDefaultValueForConfig<T>(key: BaseConfig<T>): T | undefined {
+		return undefined;
 	}
 
 }
