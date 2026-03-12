@@ -21,8 +21,9 @@ import { IExtensionContribution } from '../../common/contributions';
 
 const DEBUG_LOGS_DIR_NAME = 'debug-logs';
 const MAX_RETAINED_LOGS = 50;
-const AUTO_FLUSH_INTERVAL_MS = 2_000;
-const MAX_ATTR_VALUE_LENGTH = 500;
+const DEFAULT_FLUSH_INTERVAL_MS = 4_000;
+const MIN_FLUSH_INTERVAL_MS = 2_000;
+const MAX_ATTR_VALUE_LENGTH = 5_000;
 const MAX_PENDING_CORE_EVENTS = 100;
 
 interface IActiveLogSession {
@@ -76,6 +77,7 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 	private readonly _pendingCoreEvents: IDebugLogEntry[] = [];
 	private _debugLogsDirUri: URI | undefined;
 	private _autoFlushTimer: ReturnType<typeof setInterval> | undefined;
+	private _autoFlushIntervalMs: number;
 	private _totalBytesWritten = 0;
 	private _totalSessionCount = 0;
 
@@ -90,11 +92,22 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 	) {
 		super();
 
-		const enabled = this._configurationService.getExperimentBasedConfig(ConfigKey.TeamInternal.ChatDebugFileLogging, this._experimentationService);
+		const enabled = this._configurationService.getExperimentBasedConfig(ConfigKey.Advanced.ChatDebugFileLogging, this._experimentationService);
 		if (!enabled) {
 			this._telemetryService.sendTelemetryEvent('chatDebugFileLogger.disabled', { github: false, microsoft: true });
+			this._autoFlushIntervalMs = DEFAULT_FLUSH_INTERVAL_MS;
 			return;
 		}
+
+		this._autoFlushIntervalMs = Math.max(MIN_FLUSH_INTERVAL_MS, this._configurationService.getConfig(ConfigKey.Advanced.ChatDebugFileLoggingFlushInterval) ?? DEFAULT_FLUSH_INTERVAL_MS);
+
+		// React to flush interval changes at runtime
+		this._register(this._configurationService.onDidChangeConfiguration(e => {
+			if (e.affectsConfiguration(ConfigKey.Advanced.ChatDebugFileLoggingFlushInterval.fullyQualifiedId)) {
+				this._autoFlushIntervalMs = Math.max(MIN_FLUSH_INTERVAL_MS, this._configurationService.getConfig(ConfigKey.Advanced.ChatDebugFileLoggingFlushInterval) ?? DEFAULT_FLUSH_INTERVAL_MS);
+				this._restartFlushTimer();
+			}
+		}));
 
 		// Subscribe to OTel span completions
 		this._register(this._otelService.onDidCompleteSpan(span => {
@@ -184,8 +197,10 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 			const fileName = `${childInfo.label}-${sessionId}.jsonl`;
 			fileUri = URI.joinPath(sessionDir, fileName);
 
-			// Ensure parent session exists so we can write a cross-reference
-			this._ensureSession(childInfo.parentSessionId);
+			// Ensure parent session exists so we can write a cross-reference.
+			// A child referencing a parent proves it is a main user session,
+			// so promote it with hasOwnSpans = true.
+			this._ensureSession(childInfo.parentSessionId, /* hasOwnSpans */ true);
 
 			// Write a cross-reference entry in the parent's main.jsonl
 			this._bufferEntry(childInfo.parentSessionId, {
@@ -231,7 +246,7 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 
 		// Start auto-flush timer if this is the first active session
 		if (this._activeSessions.size === 1 && !this._autoFlushTimer) {
-			this._autoFlushTimer = setInterval(() => this._autoFlushAll(), AUTO_FLUSH_INTERVAL_MS);
+			this._autoFlushTimer = setInterval(() => this._autoFlushAll(), this._autoFlushIntervalMs);
 		}
 
 		// Fire-and-forget cleanup of old logs
@@ -259,11 +274,10 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 			return;
 		}
 
-		// Skip flushing for parent sessions that were auto-created as parent
-		// references by child sessions (e.g., subagent VS Code sessions).
-		// These have no meaningful content of their own.
+		// Skip flushing for sessions not yet confirmed as main sessions.
+		// Keep the buffer intact so entries are preserved if the session
+		// is promoted later (e.g., when a child span references it).
 		if (!session.parentSessionId && !session.hasOwnSpans) {
-			session.buffer.length = 0;
 			return;
 		}
 
@@ -312,10 +326,22 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 			this._childSessionMap.set(sessionId, { parentSessionId: parentChatSessionId, label: debugLogLabel });
 		}
 
-		// Auto-start session on first span seen for this session ID
-		this._ensureSession(sessionId, /* hasOwnSpans */ true);
-
 		const entry = this._spanToEntry(span, sessionId);
+		const opName = asString(span.attributes[GenAiAttr.OPERATION_NAME]);
+		const outputMessages = opName === GenAiOperationName.CHAT
+			? asString(span.attributes[GenAiAttr.OUTPUT_MESSAGES])
+			: undefined;
+
+		// Never auto-promote sessions from OTel spans.  Sub-requests like
+		// title generation, categorization, and progress-message generation
+		// each carry their own session IDs with real CHAT content but should
+		// not create top-level folders.  A session is only promoted to "real"
+		// (hasOwnSpans = true) when:
+		//   1. startSession() is called explicitly, or
+		//   2. A child span references it via PARENT_CHAT_SESSION_ID
+		//      (handled in _ensureSession's child branch).
+		this._ensureSession(sessionId);
+
 		if (entry) {
 			this._bufferEntry(sessionId, entry);
 		}
@@ -325,10 +351,8 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 		// contains them after completion.
 
 		// Extract agent_response from output messages (on chat spans)
-		const opName = asString(span.attributes[GenAiAttr.OPERATION_NAME]);
 		if (opName === GenAiOperationName.CHAT) {
 			// Extract agent response summary from output messages
-			const outputMessages = asString(span.attributes[GenAiAttr.OUTPUT_MESSAGES]);
 			if (outputMessages) {
 				this._bufferEntry(sessionId, {
 					ts: span.endTime,
@@ -568,6 +592,16 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 	private _autoFlushAll(): void {
 		for (const sessionId of this._activeSessions.keys()) {
 			this.flush(sessionId).catch(() => { });
+		}
+	}
+
+	private _restartFlushTimer(): void {
+		if (this._autoFlushTimer) {
+			clearInterval(this._autoFlushTimer);
+			this._autoFlushTimer = undefined;
+		}
+		if (this._activeSessions.size > 0) {
+			this._autoFlushTimer = setInterval(() => this._autoFlushAll(), this._autoFlushIntervalMs);
 		}
 	}
 

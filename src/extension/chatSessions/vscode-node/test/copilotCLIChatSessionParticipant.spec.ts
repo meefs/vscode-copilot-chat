@@ -81,6 +81,13 @@ vi.mock('vscode', async (importOriginal) => {
 	const actual = await import('../../../../vscodeTypes');
 	return {
 		...actual,
+		env: {
+			appName: 'VS Code'
+		},
+		version: 'test-vscode-version',
+		extensions: {
+			getExtension: vi.fn(() => ({ packageJSON: { version: 'test-version' } }))
+		},
 		commands: {
 			executeCommand: mockExecuteCommand
 		}
@@ -328,7 +335,7 @@ describe('CopilotCLIChatSessionParticipant.handleRequest', () => {
 						}
 					}();
 				}
-				const session = new TestCopilotCLISession(options, sdkSession, logService, workspaceService, sdk, instantiationService, delegationService, new NullRequestLogger(), new NullICopilotCLIImageSupport(), new FakeToolsService(), new FakeUserQuestionHandler());
+				const session = new TestCopilotCLISession(options, sdkSession, logService, workspaceService, sdk, instantiationService, delegationService, new NullRequestLogger(), new NullICopilotCLIImageSupport(), new FakeToolsService(), new FakeUserQuestionHandler(), accessor.get(IConfigurationService));
 				cliSessions.push(session);
 				return disposables.add(session);
 			}
@@ -595,7 +602,11 @@ describe('CopilotCLIChatSessionParticipant.handleRequest', () => {
 
 		await invalidParticipant.createHandler()(request, context, stream, requestToken);
 
-		expect(stream.output.join('\n')).toContain('Failed to load session. Unknown event type: custom.unknown.');
+		const output = stream.output.join('\n');
+		expect(output).toContain('Failed loading this session');
+		expect(output).toContain('report an issue');
+		// The error message is appended via MarkdownString.appendText which encodes spaces as &nbsp;
+		expect(output).toContain('Failed&nbsp;to&nbsp;load&nbsp;session');
 		expect(invalidSessionService.getSession).not.toHaveBeenCalled();
 		expect(invalidSessionService.createSession).not.toHaveBeenCalled();
 	});
@@ -645,7 +656,7 @@ describe('CopilotCLIChatSessionParticipant.handleRequest', () => {
 		expect(manager.sessions.size).toBe(1);
 		const delegateCallArgs = (tools.invokeTool as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
 		expect(delegateCallArgs[0]).toBe('vscode_get_modified_files_confirmation');
-		expect(delegateCallArgs[1].input.title).toBe('Delegate to Background Agent');
+		expect(delegateCallArgs[1].input.title).toBe('Delegate to Copilot CLI');
 		expect(delegateCallArgs[1].input.modifiedFiles).toHaveLength(1);
 		expect(delegateCallArgs[1].input.modifiedFiles[0].uri.toString()).toBe(Uri.file(`${sep}workspace${sep}file.ts`).toString());
 		expect(delegateCallArgs[2]).toBe(token);
