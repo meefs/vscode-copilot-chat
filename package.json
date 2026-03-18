@@ -3964,6 +3964,18 @@
 						],
 						"description": "%github.copilot.config.projectSetupInfoSkill.enabled%"
 					},
+					"github.copilot.chat.debug.promptOverrideFile": {
+						"type": [
+							"string",
+							"null"
+						],
+						"default": null,
+						"markdownDescription": "Path to a YAML file that overrides the system prompt and/or tool descriptions sent to the model.\n\n**Note**: This is an advanced debugging setting.",
+						"tags": [
+							"advanced",
+							"experimental"
+						]
+					},
 					"github.copilot.chat.edits.gemini3MultiReplaceString": {
 						"type": "boolean",
 						"default": false,
@@ -4778,11 +4790,6 @@
 					"command": "github.copilot.chat.createDraftPullRequestCopilotCLIAgentSession.createDraftPR",
 					"when": "chatSessionType == copilotcli && isSessionsWindow && !sessions.hasOpenPullRequest",
 					"group": "pull_request@2"
-				},
-				{
-					"command": "github.copilot.chat.updateCopilotCLIAgentSessionChanges.update",
-					"when": "chatSessionType == copilotcli && isSessionsWindow",
-					"group": "update@1"
 				}
 			],
 			"chat/contextUsage/actions": [
@@ -5937,7 +5944,8 @@
 					}
 				],
 				"customAgentTarget": "github-copilot",
-				"requiresCustomModels": true
+				"requiresCustomModels": true,
+				"autoAttachReferences": true
 			},
 			{
 				"type": "copilot-cloud-agent",
@@ -5956,7 +5964,8 @@
 				"when": "config.github.copilot.chat.cloudAgent.enabled",
 				"capabilities": {
 					"supportsFileAttachments": true
-				}
+				},
+				"autoAttachReferences": true
 			}
 		],
 		"debuggers": [
@@ -6230,7 +6239,7 @@
 		"lru-cache": "^11.1.0",
 		"markdown-it": "^14.1.1",
 		"minimatch": "^10.2.1",
-		"undici": "^7.18.2",
+		"undici": "^7.24.1",
 		"vscode-tas-client": "^0.1.84",
 		"web-tree-sitter": "^0.23.0"
 	},
