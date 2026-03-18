@@ -89,7 +89,7 @@
 	"l10n": "./l10n",
 	"enabledApiProposals": [
 		"agentSessionsWorkspace",
-		"chatDebug@3",
+		"chatDebug@4",
 		"chatHooks@6",
 		"extensionsAny",
 		"newSymbolNamesProvider",
@@ -2983,6 +2983,14 @@
 							"onExp"
 						]
 					},
+					"github.copilot.chat.rateLimitAutoSwitchToAuto": {
+						"type": "boolean",
+						"default": false,
+						"markdownDescription": "%github.copilot.config.rateLimitAutoSwitchToAuto%",
+						"tags": [
+							"onExp"
+						]
+					},
 					"github.copilot.chat.customInstructionsInSystemMessage": {
 						"type": "boolean",
 						"default": true,
@@ -3589,7 +3597,7 @@
 					},
 					"github.copilot.chat.languageContext.typescript.enabled": {
 						"type": "boolean",
-						"default": false,
+						"default": true,
 						"scope": "resource",
 						"tags": [
 							"experimental",
@@ -6241,7 +6249,7 @@
 		"@vscode/copilot-api": "^0.2.18",
 		"@vscode/extension-telemetry": "^1.5.1",
 		"@vscode/l10n": "^0.0.18",
-		"@vscode/prompt-tsx": "^0.4.0-alpha.6",
+		"@vscode/prompt-tsx": "^0.4.0-alpha.8",
 		"@vscode/tree-sitter-wasm": "0.0.5-php.2",
 		"@vscode/webview-ui-toolkit": "^1.3.1",
 		"@xterm/headless": "^5.5.0",
@@ -6267,5 +6275,5 @@
 		"node-gyp": "npm:node-gyp@10.3.1",
 		"zod": "3.25.76"
 	},
-	"vscodeCommit": "6f5263699012243ac0e0b5f8381fcd86ff503b2b"
+	"vscodeCommit": "98754edcba73f3cad413e0d6fb7312cd8b84e64d"
 }
