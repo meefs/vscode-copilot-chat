@@ -5974,6 +5974,14 @@
 						"description": "Complete a security review of the pending changes on the current branch"
 					},
 					{
+						"name": "simplify",
+						"description": "Review changed code for reuse, quality, and efficiency"
+					},
+					{
+						"name": "claude-api",
+						"description": "Help building with Claude API or Anthropic SDK"
+					},
+					{
 						"name": "agents",
 						"description": "Create and manage specialized Claude agents"
 					},
