@@ -777,17 +777,27 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 			this.notifyProviderOptionsChange();
 		}
 
-		return {
-			title,
-			history,
-			activeResponseCallback: undefined,
-			requestHandler: undefined,
-			options: options,
-			forkHandler: async (sessionResource, requestTurn, token) => {
-				const sessionId = SessionIdForCLI.parse(sessionResource);
-				return this.forkSession(sessionId, requestTurn?.id, token);
-			},
-		};
+		if (this.configurationService.getConfig(ConfigKey.Advanced.CLIForkSessionsEnabled)) {
+			return {
+				title,
+				history,
+				activeResponseCallback: undefined,
+				requestHandler: undefined,
+				options: options,
+				forkHandler: async (sessionResource, requestTurn, token) => {
+					const sessionId = SessionIdForCLI.parse(sessionResource);
+					return this.forkSession(sessionId, requestTurn?.id, token);
+				},
+			};
+		} else {
+			return {
+				title,
+				history,
+				activeResponseCallback: undefined,
+				requestHandler: undefined,
+				options: options,
+			};
+		}
 	}
 
 	private async forkSession(sessionId: string, requestId: string | undefined, token: CancellationToken): Promise<vscode.ChatSessionItem> {
@@ -1495,15 +1505,6 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 				const { prompt, attachments } = await this.promptResolver.resolvePrompt(request, undefined, [], session.object.workspace, [], token);
 				await session.object.handleRequest(request, { prompt }, attachments, model, authInfo, token);
 				await this.commitWorktreeChangesIfNeeded(request, session.object, token);
-
-				// Reset git state following the execution of a built-in command
-				const worktreeProperties = await this.copilotCLIWorktreeManagerService.getWorktreeProperties(session.object.sessionId);
-				if (worktreeProperties) {
-					await this.copilotCLIWorktreeManagerService.setWorktreeProperties(session.object.sessionId, {
-						...worktreeProperties,
-						changes: undefined
-					});
-				}
 			} else {
 				// Construct the full prompt with references to be sent to CLI.
 				const { prompt, attachments } = await this.promptResolver.resolvePrompt(request, undefined, [], session.object.workspace, [], token);
