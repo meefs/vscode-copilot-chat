@@ -44,7 +44,6 @@ import { CopilotCLIPromptResolver } from '../copilotcli/node/copilotcliPromptRes
 import { builtinSlashSCommands, CopilotCLICommand, copilotCLICommands, ICopilotCLISession } from '../copilotcli/node/copilotcliSession';
 import { ICopilotCLISessionItem, ICopilotCLISessionService } from '../copilotcli/node/copilotcliSessionService';
 import { ICopilotCLISessionTracker } from '../copilotcli/vscode-node/copilotCLISessionTracker';
-import { ChatSessionRepositoryTracker } from './chatSessionRepositoryTracker';
 import { convertReferenceToVariable } from './copilotCLIPromptReferences';
 import { ICopilotCLITerminalIntegration, TerminalOpenLocation } from './copilotCLITerminalIntegration';
 import { CopilotCloudSessionsProvider } from './copilotCloudSessionsProvider';
@@ -1100,7 +1099,6 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		private readonly contentProvider: CopilotCLIChatSessionContentProvider,
 		private readonly promptResolver: CopilotCLIPromptResolver,
 		private readonly cloudSessionProvider: CopilotCloudSessionsProvider | undefined,
-		private readonly repositoryTracker: ChatSessionRepositoryTracker,
 		@IGitService private readonly gitService: IGitService,
 		@ICopilotCLIModels private readonly copilotCLIModels: ICopilotCLIModels,
 		@ICopilotCLIAgents private readonly copilotCLIAgents: ICopilotCLIAgents,
@@ -1287,12 +1285,6 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			// that have auto-commit disabled. We will also create the baseline checkpoint before
 			// handling the first request of the session.
 			await this.copilotCLIWorktreeCheckpointService.handleRequest(session.object.sessionId);
-
-			// For the Sessions app, we set up a tracker to track repository changes. The repository
-			// tracker is used to provide updated changes while the session is still in progress.
-			if (vscode.workspace.isAgentSessionsWorkspace) {
-				await this.repositoryTracker.trackRepositoryChanges(session.object.sessionId);
-			}
 
 			sdkSessionId = session.object.sessionId;
 			const modeInstructions = this.createModeInstructions(request);
@@ -1544,10 +1536,9 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 
 	/**
 	 * Gets the agent to be used.
-	 * If creating a new session, then uses the agent configured in settings.
-	 * If opening an existing session, then uses the agent associated with that session.
-	 * If creating a new session with a prompt file that specifies an agent, then uses that agent.
+	 * If the request has a prompt file (modeInstructions2) that specifies an agent, uses that agent.
 	 * If the prompt file specifies tools, those tools override the agent's default tools.
+	 * Otherwise returns undefined (no agent).
 	 */
 	private async getAgent(sessionId: string | undefined, request: vscode.ChatRequest | undefined, token: vscode.CancellationToken): Promise<SweCustomAgent | undefined> {
 		// If we have a prompt file that specifies an agent or tools, use that.
@@ -1561,8 +1552,8 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 				return customAgent;
 			}
 		}
-		const sessionAgent = sessionId ? await this.chatSessionMetadataStore.getSessionAgent(sessionId) : undefined;
-		return sessionAgent ? await this.copilotCLIAgents.resolveAgent(sessionAgent) : undefined;
+		// If not found, don't use any agent, default to empty agent.
+		return undefined;
 	}
 
 	private async getPromptInfoFromRequest(request: vscode.ChatRequest, token: vscode.CancellationToken): Promise<ParsedPromptFile | undefined> {

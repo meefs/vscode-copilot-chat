@@ -15,8 +15,8 @@ import { IFileSystemService } from '../../../platform/filesystem/common/fileSyst
 import { IGitExtensionService } from '../../../platform/git/common/gitExtensionService';
 import { getGitHubRepoInfoFromContext, IGitService, RepoContext } from '../../../platform/git/common/gitService';
 import { toGitUri } from '../../../platform/git/common/utils';
-import { IOctoKitService } from '../../../platform/github/common/githubService';
 import { derivePullRequestState } from '../../../platform/github/common/githubAPI';
+import { IOctoKitService } from '../../../platform/github/common/githubService';
 import { ILogService } from '../../../platform/log/common/logService';
 import { IPromptsService, ParsedPromptFile } from '../../../platform/promptFiles/common/promptsService';
 import { ITelemetryService } from '../../../platform/telemetry/common/telemetry';
@@ -26,7 +26,7 @@ import { DeferredPromise, disposableTimeout, IntervalTimer, SequencerByKey, Thro
 import { CancellationToken } from '../../../util/vs/base/common/cancellation';
 import { isCancellationError } from '../../../util/vs/base/common/errors';
 import { Emitter, Event } from '../../../util/vs/base/common/event';
-import { Disposable, DisposableStore, IDisposable, IReference, toDisposable } from '../../../util/vs/base/common/lifecycle';
+import { Disposable, DisposableStore, IDisposable, IReference } from '../../../util/vs/base/common/lifecycle';
 import { relative } from '../../../util/vs/base/common/path';
 import { basename, dirname, extUri, isEqual } from '../../../util/vs/base/common/resources';
 import { URI } from '../../../util/vs/base/common/uri';
@@ -48,7 +48,6 @@ import { CopilotCLIPromptResolver } from '../copilotcli/node/copilotcliPromptRes
 import { builtinSlashSCommands, CopilotCLICommand, copilotCLICommands, ICopilotCLISession } from '../copilotcli/node/copilotcliSession';
 import { ICopilotCLISessionItem, ICopilotCLISessionService } from '../copilotcli/node/copilotcliSessionService';
 import { ICopilotCLISessionTracker } from '../copilotcli/vscode-node/copilotCLISessionTracker';
-import { ChatSessionRepositoryTracker } from './chatSessionRepositoryTracker';
 import { ICopilotCLIChatSessionItemProvider } from './copilotCLIChatSessions';
 import { convertReferenceToVariable } from './copilotCLIPromptReferences';
 import { ICopilotCLITerminalIntegration, TerminalOpenLocation } from './copilotCLITerminalIntegration';
@@ -157,6 +156,11 @@ export class CopilotCLIChatSessionItemProvider extends Disposable implements vsc
 	// There's an issue in core (about holding onto ref of the Chat Model).
 	// As a temporary solution, return the same untitled session id back to core until the session is completed.
 	public readonly untitledSessionIdMapping = new Map<string, string>();
+	/**
+	 * Until the untitled session is properly swappped with the new session, we should keep track of this mapping.
+	 * When VS Code asks for the session, always return the old untitled session Uri.
+	 */
+	public readonly sdkToUntitledUriMapping = new Map<string, Uri>();
 	private readonly _onDidChangeChatSessionItems = this._register(new Emitter<void>());
 	public readonly onDidChangeChatSessionItems: Event<void> = this._onDidChangeChatSessionItems.event;
 
@@ -237,7 +241,7 @@ export class CopilotCLIChatSessionItemProvider extends Disposable implements vsc
 	}
 
 	public async toChatSessionItem(session: ICopilotCLISessionItem): Promise<vscode.ChatSessionItem> {
-		const resource = SessionIdForCLI.getResource(this.untitledSessionIdMapping.get(session.id) ?? session.id);
+		const resource = this.sdkToUntitledUriMapping.get(session.id) ?? SessionIdForCLI.getResource(this.untitledSessionIdMapping.get(session.id) ?? session.id);
 		const worktreeProperties = await this.worktreeManager.getWorktreeProperties(session.id);
 		const workingDirectory = worktreeProperties?.worktreePath ? vscode.Uri.file(worktreeProperties.worktreePath)
 			: session.workingDirectory;
@@ -1126,7 +1130,6 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		private readonly promptResolver: CopilotCLIPromptResolver,
 		private readonly sessionItemProvider: CopilotCLIChatSessionItemProvider,
 		private readonly cloudSessionProvider: CopilotCloudSessionsProvider | undefined,
-		private readonly repositoryTracker: ChatSessionRepositoryTracker,
 		@IGitService private readonly gitService: IGitService,
 		@ICopilotCLIModels private readonly copilotCLIModels: ICopilotCLIModels,
 		@ICopilotCLIAgents private readonly copilotCLIAgents: ICopilotCLIAgents,
@@ -1358,18 +1361,9 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			// handling the first request of the session.
 			await this.copilotCLIWorktreeCheckpointService.handleRequest(session.object.sessionId);
 
-			// For the Sessions app, we set up a tracker to track repository changes. The repository
-			// tracker is used to provide updated changes while the session is still in progress.
-			if (vscode.workspace.isAgentSessionsWorkspace) {
-				await this.repositoryTracker.trackRepositoryChanges(session.object.sessionId);
-			}
-
 			sdkSessionId = session.object.sessionId;
 			const modeInstructions = this.createModeInstructions(request);
 			this.chatSessionMetadataStore.updateRequestDetails(sessionId, [{ vscodeRequestId: request.id, agentId: agent?.name ?? '', modeInstructions }]).catch(ex => this.logService.error(ex, 'Failed to update request details'));
-			if (isUntitled) {
-				disposables.add(toDisposable(() => this.sessionItemProvider.untitledSessionIdMapping.delete(session.object.sessionId)));
-			}
 
 			// Lock the repo option with more accurate information.
 			// Previously we just updated it with details of the folder.
@@ -1429,7 +1423,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 				_sessionBranch.delete(id);
 				_sessionIsolation.delete(id);
 				this.sessionItemProvider.untitledSessionIdMapping.delete(id);
-				this.sessionItemProvider.untitledSessionIdMapping.delete(session.object.sessionId);
+				this.sessionItemProvider.sdkToUntitledUriMapping.delete(session.object.sessionId);
 				this.folderRepositoryManager.deleteNewSessionFolder(id);
 				this.sessionItemProvider.swap(chatSessionContext.chatSessionItem, { resource: SessionIdForCLI.getResource(session.object.sessionId), label: request.prompt });
 			}
@@ -1666,10 +1660,9 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 
 	/**
 	 * Gets the agent to be used.
-	 * If creating a new session, then uses the agent configured in settings.
-	 * If opening an existing session, then uses the agent associated with that session.
-	 * If creating a new session with a prompt file that specifies an agent, then uses that agent.
+	 * If the request has a prompt file (modeInstructions2) that specifies an agent, uses that agent.
 	 * If the prompt file specifies tools, those tools override the agent's default tools.
+	 * Otherwise returns undefined (no agent).
 	 */
 	private async getAgent(sessionId: string | undefined, request: vscode.ChatRequest | undefined, token: vscode.CancellationToken): Promise<SweCustomAgent | undefined> {
 		// If we have a prompt file that specifies an agent or tools, use that.
@@ -1683,8 +1676,8 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 				return customAgent;
 			}
 		}
-		const sessionAgent = sessionId ? await this.chatSessionMetadataStore.getSessionAgent(sessionId) : undefined;
-		return sessionAgent ? await this.copilotCLIAgents.resolveAgent(sessionAgent) : undefined;
+		// If not found, don't use any agent, default to empty agent.
+		return undefined;
 	}
 
 	private async getPromptInfoFromRequest(request: vscode.ChatRequest, token: vscode.CancellationToken): Promise<ParsedPromptFile | undefined> {
@@ -1729,6 +1722,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		this.logService.info(`Using Copilot CLI session: ${session.object.sessionId} (isNewSession: ${isNewSession}, isolationEnabled: ${isIsolationEnabled(workspaceInfo)}, workingDirectory: ${workingDirectory}, worktreePath: ${worktreeProperties?.worktreePath})`);
 		if (isNewSession) {
 			this.sessionItemProvider.untitledSessionIdMapping.set(id, session.object.sessionId);
+			this.sessionItemProvider.sdkToUntitledUriMapping.set(session.object.sessionId, resource);
 			if (worktreeProperties) {
 				void this.copilotCLIWorktreeManagerService.setWorktreeProperties(session.object.sessionId, worktreeProperties);
 			}
