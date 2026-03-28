@@ -30,7 +30,7 @@ import { relative } from '../../../util/vs/base/common/path';
 import { basename, dirname, extUri, isEqual } from '../../../util/vs/base/common/resources';
 import { URI } from '../../../util/vs/base/common/uri';
 import { EXTENSION_ID } from '../../common/constants';
-import { ChatVariablesCollection, isPromptFile } from '../../prompt/common/chatVariablesCollection';
+import { ChatVariablesCollection, extractDebugTargetSessionIds, isPromptFile } from '../../prompt/common/chatVariablesCollection';
 import { IChatSessionMetadataStore, StoredModeInstructions } from '../common/chatSessionMetadataStore';
 import { IChatSessionWorkspaceFolderService } from '../common/chatSessionWorkspaceFolderService';
 import { IChatSessionWorktreeCheckpointService } from '../common/chatSessionWorktreeCheckpointService';
@@ -1594,10 +1594,11 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 
 		const model = options.model;
 		const agent = options.agent;
+		const debugTargetSessionIds = extractDebugTargetSessionIds(request.references);
 		const mcpServerMappings = buildMcpServerMappings(request.tools);
 		const session = isNewSession ?
-			await this.sessionService.createSession({ sessionId, model, workspaceInfo, agent, mcpServerMappings }, token) :
-			await this.sessionService.getSession({ sessionId, model, workspaceInfo, agent, readonly: false, mcpServerMappings }, token);
+			await this.sessionService.createSession({ sessionId, model, workspaceInfo, agent, debugTargetSessionIds, mcpServerMappings }, token) :
+			await this.sessionService.getSession({ sessionId, model, workspaceInfo, agent, readonly: false, debugTargetSessionIds, mcpServerMappings }, token);
 		// TODO @DonJayamanne We need to refresh to add this new session, but we need a label.
 		// So when creating a session we need a dummy label (or an initial prompt).
 
@@ -2266,15 +2267,22 @@ export function registerCLIChatCommands(
 
 		const sessionId = SessionIdForCLI.parse(resource);
 		const worktreeProperties = await copilotCLIWorktreeManagerService.getWorktreeProperties(sessionId);
+		const workspaceFolder = await copilotCliWorkspaceSession.getSessionWorkspaceFolder(sessionId);
 
-		if (!worktreeProperties) {
+		if (!worktreeProperties && !workspaceFolder) {
 			return;
 		}
 
-		await copilotCLIWorktreeManagerService.setWorktreeProperties(sessionId, {
-			...worktreeProperties,
-			changes: undefined
-		});
+		if (worktreeProperties) {
+			// Worktree
+			await copilotCLIWorktreeManagerService.setWorktreeProperties(sessionId, {
+				...worktreeProperties,
+				changes: undefined
+			});
+		} else if (workspaceFolder) {
+			// Workspace
+			copilotCliWorkspaceSession.clearWorkspaceChanges(workspaceFolder);
+		}
 
 		await contentProvider.refreshSession({ reason: 'update', sessionId });
 	}));
@@ -2292,6 +2300,34 @@ export function registerCLIChatCommands(
 			resource,
 			prompt: builtinSlashSCommands.commit,
 		});
+	}));
+
+	disposableStore.add(vscode.commands.registerCommand('github.copilot.sessions.discardChanges', async (sessionResource: vscode.Uri, ref: string, ...resources: vscode.Uri[]) => {
+		if (!isUri(sessionResource) || !ref || resources.length === 0 || resources.some(r => !isUri(r))) {
+			return;
+		}
+
+		const sessionId = SessionIdForCLI.parse(sessionResource);
+		const worktreeProperties = await copilotCLIWorktreeManagerService.getWorktreeProperties(sessionId);
+		const workspaceFolder = await copilotCliWorkspaceSession.getSessionWorkspaceFolder(sessionId);
+
+		const repositoryUri = worktreeProperties ? Uri.file(worktreeProperties.worktreePath) : workspaceFolder;
+		const repository = repositoryUri ? await gitService.getRepository(repositoryUri) : undefined;
+		if (!repository) {
+			return;
+		}
+
+		const confirmAction = l10n.t('Discard Changes');
+		const message = resources.length === 1
+			? l10n.t('Are you sure you want to discard the changes in \'{0}\'? This action cannot be undone.', basename(resources[0]))
+			: l10n.t('Are you sure you want to discard the changes in these {0} files? This action cannot be undone.', resources.length);
+
+		const choice = await vscode.window.showWarningMessage(message, { modal: true }, confirmAction);
+		if (choice !== confirmAction) {
+			return;
+		}
+
+		await gitService.restore(repository.rootUri, resources.map(r => r.fsPath), { ref });
 	}));
 
 	disposableStore.add(vscode.commands.registerCommand('github.copilot.chat.createPullRequestCopilotCLIAgentSession.createPR', async (sessionItemOrResource?: vscode.ChatSessionItem | vscode.Uri) => {
@@ -2581,7 +2617,7 @@ async function detectPullRequestFromGitHubAPI(
 		repoInfo.id.org,
 		repoInfo.id.repo,
 		branchName,
-		{ createIfNone: false },
+		{},
 	);
 
 	if (pr?.url) {

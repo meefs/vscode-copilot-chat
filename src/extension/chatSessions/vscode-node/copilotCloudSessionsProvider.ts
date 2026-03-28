@@ -13,7 +13,7 @@ import { IVSCodeExtensionContext } from '../../../platform/extContext/common/ext
 import { IGitExtensionService } from '../../../platform/git/common/gitExtensionService';
 import { GithubRepoId, IGitService } from '../../../platform/git/common/gitService';
 import { derivePullRequestState, PullRequestSearchItem, SessionInfo } from '../../../platform/github/common/githubAPI';
-import { CCAEnabledResult, IGithubRepositoryService, IOctoKitService, JobInfo, RemoteAgentJobResponse } from '../../../platform/github/common/githubService';
+import { AuthOptions, CCAEnabledResult, IGithubRepositoryService, IOctoKitService, JobInfo, RemoteAgentJobResponse } from '../../../platform/github/common/githubService';
 import { ILogService } from '../../../platform/log/common/logService';
 import { IExperimentationService } from '../../../platform/telemetry/common/nullExperimentationService';
 import { ITelemetryService } from '../../../platform/telemetry/common/telemetry';
@@ -27,15 +27,22 @@ import { isUntitledSessionId } from '../common/utils';
 import { IChatDelegationSummaryService } from '../copilotcli/common/delegationSummaryService';
 import { body_suffix, CONTINUE_TRUNCATION, extractTitle, formatBodyPlaceholder, getAuthorDisplayName, getRepoId, JOBS_API_VERSION, SessionIdForPr, toOpenPullRequestWebviewUri, truncatePrompt } from '../vscode/copilotCodingAgentUtils';
 import { CopilotCloudGitOperationsManager } from './copilotCloudGitOperationsManager';
-import { ChatSessionContentBuilder } from './copilotCloudSessionContentBuilder';
+import { ChatSessionContentBuilder, SessionResponseLogChunk } from './copilotCloudSessionContentBuilder';
 import { IPullRequestFileChangesService } from './pullRequestFileChangesService';
 import MarkdownIt = require('markdown-it');
+
+const CLOUD_SESSIONS_AUTH_OPTIONS: AuthOptions = { createIfNone: { detail: l10n.t('Sign in to GitHub to access Copilot cloud sessions.') } };
 
 interface ConfirmationMetadata {
 	prompt: string;
 	references?: readonly vscode.ChatPromptReference[];
 	chatContext: vscode.ChatContext;
 }
+
+type InitialSessionOption = {
+	readonly optionId: string;
+	readonly value: string | vscode.ChatSessionProviderOptionItem;
+};
 
 function validateMetadata(metadata: unknown): asserts metadata is ConfirmationMetadata {
 	if (typeof metadata !== 'object') {
@@ -49,6 +56,82 @@ function validateMetadata(metadata: unknown): asserts metadata is ConfirmationMe
 	}
 	if (typeof (metadata as ConfirmationMetadata).chatContext !== 'object' || (metadata as ConfirmationMetadata).chatContext === null) {
 		throw new Error('Invalid confirmation metadata: missing or invalid chatContext.');
+	}
+}
+
+function describeRuntimeValue(value: unknown): string {
+	if (Array.isArray(value)) {
+		return `array(length=${value.length})`;
+	}
+
+	if (value === null) {
+		return 'null';
+	}
+
+	if (value === undefined) {
+		return 'undefined';
+	}
+
+	if (typeof value === 'object') {
+		const keys = Object.keys(value);
+		return `object(keys=${keys.slice(0, 5).join(',')}${keys.length > 5 ? ',…' : ''})`;
+	}
+
+	return typeof value;
+}
+
+function isOptionItemValue(value: unknown): value is vscode.ChatSessionProviderOptionItem {
+	return typeof value === 'object' && value !== null && 'id' in value && typeof value.id === 'string';
+}
+
+function isInitialSessionOption(value: unknown): value is InitialSessionOption {
+	if (typeof value !== 'object' || value === null || !('optionId' in value) || typeof value.optionId !== 'string' || !('value' in value)) {
+		return false;
+	}
+
+	return typeof value.value === 'string' || isOptionItemValue(value.value);
+}
+
+export function normalizeInitialSessionOptions(initialOptions: unknown, logService?: ILogService, chatResource?: vscode.Uri): readonly InitialSessionOption[] {
+	if (!initialOptions) {
+		return [];
+	}
+
+	if (Array.isArray(initialOptions)) {
+		const normalized = initialOptions.filter(isInitialSessionOption);
+		if (logService && normalized.length !== initialOptions.length) {
+			logService.warn(`[chatParticipantImpl] Ignoring ${initialOptions.length - normalized.length} malformed initialSessionOptions entries for ${chatResource?.toString() ?? 'unknown-resource'}. Received ${describeRuntimeValue(initialOptions)}.`);
+		}
+
+		return normalized;
+	}
+
+	if (typeof initialOptions === 'object') {
+		const normalized: InitialSessionOption[] = [];
+		for (const [optionId, value] of Object.entries(initialOptions)) {
+			if (isInitialSessionOption(value)) {
+				normalized.push(value);
+			} else if (typeof value === 'string' || isOptionItemValue(value)) {
+				normalized.push({ optionId, value });
+			}
+		}
+
+		if (normalized.length > 0) {
+			logService?.warn(`[chatParticipantImpl] Coerced object-shaped initialSessionOptions for ${chatResource?.toString() ?? 'unknown-resource'}. Received ${describeRuntimeValue(initialOptions)} and recovered ${normalized.length} entries.`);
+			return normalized;
+		}
+	}
+
+	logService?.warn(`[chatParticipantImpl] Ignoring unsupported initialSessionOptions for ${chatResource?.toString() ?? 'unknown-resource'}. Received ${describeRuntimeValue(initialOptions)}.`);
+	return [];
+}
+
+export function parseSessionLogChunksSafely(rawText: string, logService: ILogService, parser: (value: string) => SessionResponseLogChunk[]): SessionResponseLogChunk[] {
+	try {
+		return parser(rawText);
+	} catch (error) {
+		logService.error(error instanceof Error ? error : new Error(String(error)), `[streamNewLogContent] Failed to parse streamed log content (${rawText.length} chars).`);
+		return [];
 	}
 }
 
@@ -252,7 +335,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 				let intervalMs: number;
 				let hasHistoricalSessions: boolean;
 				try {
-					const sessions = await Promise.all(repoIds.map(repoId => this._octoKitService.getAllSessions(`${repoId.org}/${repoId.repo}`, false, { createIfNone: false })));
+					const sessions = await Promise.all(repoIds.map(repoId => this._octoKitService.getAllSessions(`${repoId.org}/${repoId.repo}`, false, {})));
 					hasHistoricalSessions = sessions.some(s => s.length > 0);
 					intervalMs = this.getRefreshIntervalTime(hasHistoricalSessions);
 				} catch (e) {
@@ -266,7 +349,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 				const schedulerCallback = async () => {
 					let sessions = [];
 					try {
-						sessions = await Promise.all(repoIds.map(repoId => this._octoKitService.getAllSessions(`${repoId.org}/${repoId.repo}`, true, { createIfNone: false })));
+						sessions = await Promise.all(repoIds.map(repoId => this._octoKitService.getAllSessions(`${repoId.org}/${repoId.repo}`, true, {})));
 						sessions = sessions.flat();
 						if (this.cachedSessionsSize !== sessions.length) {
 							this.refresh();
@@ -524,7 +607,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 			return cached;
 		}
 
-		const result = await this._octoKitService.isCCAEnabled(owner, repo, { createIfNone: false });
+		const result = await this._octoKitService.isCCAEnabled(owner, repo, {});
 
 		// Only cache enabled=true results with a TTL; disabled results should always re-fetch
 		if (result.enabled === true) {
@@ -592,7 +675,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 			// Fetch only the active sessions using allSettled to handle individual failures
 			const sessionResults = await Promise.allSettled(
 				Array.from(this.activeSessionIds).map(sessionId =>
-					this._octoKitService.getSessionInfo(sessionId, { createIfNone: true })
+					this._octoKitService.getSessionInfo(sessionId, CLOUD_SESSIONS_AUTH_OPTIONS)
 				)
 			);
 
@@ -644,7 +727,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 	private async getAvailablePartnerAgents(owner: string, repo: string): Promise<{ id: string; name: string; at?: string; codiconId?: string }[]> {
 		try {
 			// Fetch assignable actors for the repository
-			const assignableActors = await this._octoKitService.getAssignableActors(owner, repo, { createIfNone: false });
+			const assignableActors = await this._octoKitService.getAssignableActors(owner, repo, {});
 
 			// Check which agents from HARDCODED_PARTNER_AGENTS are assignable
 			const availableAgents: { id: string; name: string; at?: string; codiconId?: string }[] = [];
@@ -756,8 +839,8 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 		try {
 			// Fetch agents (requires repo), models (global), and partner agents in parallel
 			const [customAgents, models, partnerAgents] = await Promise.allSettled([
-				repoId && repoIds?.length === 1 ? this._octoKitService.getCustomAgents(repoId.org, repoId.repo, { excludeInvalidConfig: true }, { createIfNone: false }) : Promise.resolve([]),
-				this._octoKitService.getCopilotAgentModels({ createIfNone: false }),
+				repoId && repoIds?.length === 1 ? this._octoKitService.getCustomAgents(repoId.org, repoId.repo, { excludeInvalidConfig: true }, {}) : Promise.resolve([]),
+				this._octoKitService.getCopilotAgentModels({}),
 				repoId ? this.getAvailablePartnerAgents(repoId.org, repoId.repo) : Promise.resolve([])
 			]);
 
@@ -880,7 +963,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 			} else {
 				// Fetch repos from recent push events (repos user has recently committed to)
 				try {
-					const recentlyCommittedRepos = await this._octoKitService.getRecentlyCommittedRepositories({ createIfNone: false });
+					const recentlyCommittedRepos = await this._octoKitService.getRecentlyCommittedRepositories({});
 					for (const repo of recentlyCommittedRepos) {
 						const nwo = `${repo.owner}/${repo.name}`;
 						items.push({
@@ -916,7 +999,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 	private async fetchAllRepositoriesFromGitHub(query?: string): Promise<vscode.ChatSessionProviderOptionItem[]> {
 		try {
 			// Fetch repos user has access to, optionally filtered by search query
-			const repos = await this._octoKitService.getUserRepositories({ createIfNone: false }, query);
+			const repos = await this._octoKitService.getUserRepositories({}, query);
 
 			// Sort alphabetically and convert to option items
 			return repos
@@ -988,9 +1071,9 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 			}
 			let sessions = [];
 			if (vscode.workspace.isAgentSessionsWorkspace || !repoIds || repoIds.length === 0) {
-				sessions = await this._octoKitService.getAllSessions(undefined, true, { createIfNone: false });
+				sessions = await this._octoKitService.getAllSessions(undefined, true, {});
 			} else {
-				sessions = (await Promise.all(repoIds.map(repo => this._octoKitService.getAllSessions(`${repo.org}/${repo.repo}`, true, { createIfNone: false })))).flat();
+				sessions = (await Promise.all(repoIds.map(repo => this._octoKitService.getAllSessions(`${repo.org}/${repo.repo}`, true, {})))).flat();
 			}
 			this.logService.debug(`copilotCloudSessionsProvider#provideChatSessionItems: fetched ${sessions.length} sessions`);
 			this.cachedSessionsSize = sessions.length;
@@ -1024,7 +1107,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 			const uniqueGlobalIds = new Set(Array.from(latestSessionsMap.values()).map(s => s.resource_global_id));
 			const prFetches = Array.from(uniqueGlobalIds).map(async globalId => {
 				try {
-					const pr = await this._octoKitService.getPullRequestFromGlobalId(globalId, { createIfNone: false });
+					const pr = await this._octoKitService.getPullRequestFromGlobalId(globalId, {});
 					return { globalId, pr };
 				} catch (e) {
 					this.logService.warn(`Failed to fetch PR for global ID ${globalId}: ${e instanceof Error ? e.message : String(e)}`);
@@ -1161,7 +1244,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 				summaryReference.complete(undefined);
 				return undefined;
 			}
-			const jobInfo = await this._octoKitService.getJobBySessionId(repoOwner, repoName, sessions[0].id, 'vscode-copilot-chat', { createIfNone: true });
+			const jobInfo = await this._octoKitService.getJobBySessionId(repoOwner, repoName, sessions[0].id, 'vscode-copilot-chat', CLOUD_SESSIONS_AUTH_OPTIONS);
 			let prompt = jobInfo?.problem_statement || 'Initial Implementation';
 			// When delegating, we append the summary to the prompt, & that can be very large and doesn't look great.
 			// Turn the summary into a reference instead.
@@ -1202,7 +1285,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 			return match ?? getDefault();
 		};
 
-		const sessions = await this._octoKitService.getCopilotSessionsForPR(pr.fullDatabaseId.toString(), { createIfNone: true });
+		const sessions = await this._octoKitService.getCopilotSessionsForPR(pr.fullDatabaseId.toString(), CLOUD_SESSIONS_AUTH_OPTIONS);
 		const sortedSessions = sessions
 			.filter((session, index, array) =>
 				array.findIndex(s => s.id === session.id) === index
@@ -1217,7 +1300,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 		});
 
 		const sessionContentBuilder = new ChatSessionContentBuilder(CopilotCloudSessionsProvider.TYPE, this._gitService);
-		const history = await sessionContentBuilder.buildSessionHistory(getProblemStatement(pr.repository.owner.login, pr.repository.name, sortedSessions), sortedSessions, pr, (sessionId: string) => this._octoKitService.getSessionLogs(sessionId, { createIfNone: true }), storedReferences);
+		const history = await sessionContentBuilder.buildSessionHistory(getProblemStatement(pr.repository.owner.login, pr.repository.name, sortedSessions), sortedSessions, pr, (sessionId: string) => this._octoKitService.getSessionLogs(sessionId, CLOUD_SESSIONS_AUTH_OPTIONS), storedReferences);
 
 		// const selectedCustomAgent = undefined; /* TODO: Needs API to support this. */
 		// const selectedModel = undefined; /* TODO: Needs API to support this. */
@@ -1334,7 +1417,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 		}
 		try {
 			pr = await retry(async () => {
-				const pullRequests = await this._octoKitService.getOpenPullRequestsForUser(repoOwner, repoName, { createIfNone: true });
+				const pullRequests = await this._octoKitService.getOpenPullRequestsForUser(repoOwner, repoName, CLOUD_SESSIONS_AUTH_OPTIONS);
 				const found = pullRequests.find(p => p.number === prNumber);
 				if (!found) {
 					this.logService.warn(`Pull request ${prNumber} is not visible yet, retrying...`);
@@ -1522,7 +1605,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 		}
 
 		stream.progress(vscode.l10n.t('Fetching pull request details'));
-		const pullRequest = await this.findPR(number, { retries: 5, repository: selectedRepository });
+		const pullRequest = await this.findPR(number, { retries: 7, repository: selectedRepository });
 		if (!pullRequest) {
 			throw new Error(`Failed to find pull request #${number} after delegation.`);
 		}
@@ -1594,7 +1677,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 		if (selection.includes(this.AUTHORIZE.toUpperCase())) {
 			stream.progress(vscode.l10n.t('Authorizing'));
 			try {
-				await this._authenticationService.getGitHubSession('permissive', { createIfNone: true });
+				await this._authenticationService.getGitHubSession('permissive', { createIfNone: { detail: l10n.t('Sign in to GitHub with additional permissions to use Copilot cloud sessions.') } });
 				if (!this._authenticationService.permissiveGitHubSession) {
 					throw new Error('Failed to obtain permissive GitHub session');
 				}
@@ -1839,8 +1922,11 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 		const chatResource = context.chatSessionContext?.chatSessionItem?.resource;
 
 		const initialOptions = context.chatSessionContext?.initialSessionOptions;
-		if (chatResource && initialOptions) {
-			for (const opt of initialOptions) {
+		if (chatResource) {
+			this.logService.trace(`[chatParticipantImpl] initialSessionOptions for ${chatResource.toString()}: ${describeRuntimeValue(initialOptions)}`);
+		}
+		if (chatResource) {
+			for (const opt of normalizeInitialSessionOptions(initialOptions, this.logService, chatResource)) {
 				const value = typeof opt.value === 'string' ? opt.value : opt.value.id;
 				if (opt.optionId === CUSTOM_AGENTS_OPTION_GROUP_ID) {
 					this.sessionCustomAgentMap.set(chatResource, value);
@@ -2074,14 +2160,14 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 					}
 
 					// Get the specific session info
-					const sessionInfo = await this._octoKitService.getSessionInfo(sessionId, { createIfNone: true });
+					const sessionInfo = await this._octoKitService.getSessionInfo(sessionId, CLOUD_SESSIONS_AUTH_OPTIONS);
 					if (!sessionInfo || token.isCancellationRequested) {
 						complete();
 						return;
 					}
 
 					// Get session logs
-					const logs = await this._octoKitService.getSessionLogs(sessionId, { createIfNone: true });
+					const logs = await this._octoKitService.getSessionLogs(sessionId, CLOUD_SESSIONS_AUTH_OPTIONS);
 
 					// Check if session is still in progress
 					if (sessionInfo.state !== 'in_progress') {
@@ -2150,19 +2236,32 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 
 			// Parse the new log content
 			const contentBuilder = new ChatSessionContentBuilder(CopilotCloudSessionsProvider.TYPE, this._gitService);
-
-			const logChunks = contentBuilder.parseSessionLogs(newLogContent);
+			const logChunks = parseSessionLogChunksSafely(newLogContent, this.logService, value => contentBuilder.parseSessionLogs(value));
 			let hasStreamedContent = false;
 			let hasSetupStepProgress = false;
 
-			for (const chunk of logChunks) {
+			for (const [chunkIndex, chunk] of logChunks.entries()) {
+				if (!Array.isArray(chunk.choices)) {
+					this.logService.warn(`[streamNewLogContent] Ignoring chunk ${chunkIndex} with non-array choices for PR #${pullRequest.number}.`);
+					continue;
+				}
+
 				for (const choice of chunk.choices) {
+					if (!choice?.delta) {
+						this.logService.warn(`[streamNewLogContent] Ignoring chunk ${chunkIndex} with missing delta for PR #${pullRequest.number}.`);
+						continue;
+					}
+
 					const delta = choice.delta;
+					const toolCalls = Array.isArray(delta.tool_calls) ? delta.tool_calls : undefined;
+					if (delta.tool_calls && !toolCalls) {
+						this.logService.warn(`[streamNewLogContent] Ignoring non-array tool_calls for PR #${pullRequest.number}.`);
+					}
 
 					if (delta.role === 'assistant') {
 						// Handle special case for run_custom_setup_step/run_setup
-						if (choice.finish_reason === 'tool_calls' && delta.tool_calls?.length && (delta.tool_calls[0].function.name === 'run_custom_setup_step' || delta.tool_calls[0].function.name === 'run_setup')) {
-							const toolCall = delta.tool_calls[0];
+						if (choice.finish_reason === 'tool_calls' && toolCalls?.length && (toolCalls[0].function.name === 'run_custom_setup_step' || toolCalls[0].function.name === 'run_setup')) {
+							const toolCall = toolCalls[0];
 							let args: any = {};
 							try {
 								args = JSON.parse(toolCall.function.arguments);
@@ -2193,8 +2292,8 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 								}
 							}
 
-							if (delta.tool_calls) {
-								for (const toolCall of delta.tool_calls) {
+							if (toolCalls) {
+								for (const toolCall of toolCalls) {
 									const toolPart = contentBuilder.createToolInvocationPart(pullRequest, toolCall, delta.content || '');
 									if (toolPart) {
 										stream.push(toolPart);
@@ -2241,7 +2340,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 		// Allow for a short delay before the session is marked as 'queued'
 		let waitForQueuedCount = 0;
 		do {
-			sessionInfo = await this._octoKitService.getSessionInfo(sessionId, { createIfNone: true });
+			sessionInfo = await this._octoKitService.getSessionInfo(sessionId, CLOUD_SESSIONS_AUTH_OPTIONS);
 			if (sessionInfo && sessionInfo.state === 'queued') {
 				this.logService.trace('Queued session found');
 				break;
@@ -2270,7 +2369,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 
 		this.logService.trace(`Session ${sessionInfo.id} is queued, waiting for transition to in_progress...`);
 		while (Date.now() - startTime < maxWaitTime && (!token || !token.isCancellationRequested)) {
-			const sessionInfo = await this._octoKitService.getSessionInfo(sessionId, { createIfNone: true });
+			const sessionInfo = await this._octoKitService.getSessionInfo(sessionId, CLOUD_SESSIONS_AUTH_OPTIONS);
 			if (sessionInfo?.state === 'in_progress') {
 				this.logService.trace(`Session ${sessionInfo.id} now in progress.`);
 				this.refresh();
@@ -2288,7 +2387,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 		waitForTransitionToInProgress: boolean = false
 	): Promise<SessionInfo | undefined> {
 		// Get the current number of sessions
-		const initialSessions = await this._octoKitService.getCopilotSessionsForPR(pullRequest.fullDatabaseId.toString(), { createIfNone: true });
+		const initialSessions = await this._octoKitService.getCopilotSessionsForPR(pullRequest.fullDatabaseId.toString(), CLOUD_SESSIONS_AUTH_OPTIONS);
 		const initialSessionCount = initialSessions.length;
 
 		// Poll for a new session to start
@@ -2297,7 +2396,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 		const startTime = Date.now();
 
 		while (Date.now() - startTime < maxWaitTime && !token.isCancellationRequested) {
-			const currentSessions = await this._octoKitService.getCopilotSessionsForPR(pullRequest.fullDatabaseId.toString(), { createIfNone: true });
+			const currentSessions = await this._octoKitService.getCopilotSessionsForPR(pullRequest.fullDatabaseId.toString(), CLOUD_SESSIONS_AUTH_OPTIONS);
 
 			// Check if a new session has started
 			if (currentSessions.length > initialSessionCount) {
@@ -2341,7 +2440,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 			}
 			const commentBody = `@${targetAgent} ${userPrompt} ${summary ? '\n\n' + summary : ''}`;
 
-			const commentResult = await this._octoKitService.addPullRequestComment(pr.id, commentBody, { createIfNone: true });
+			const commentResult = await this._octoKitService.addPullRequestComment(pr.id, commentBody, CLOUD_SESSIONS_AUTH_OPTIONS);
 			if (!commentResult) {
 				this.logService.error(`Failed to add comment to PR #${pullRequestNumber}`);
 				return;
@@ -2372,7 +2471,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 		this.logService.trace(`Waiting for job ${jobId} to have pull request information...`);
 
 		while (Date.now() - startTime < maxWaitTime && (!token || !token.isCancellationRequested)) {
-			const jobInfo = await this._octoKitService.getJobByJobId(owner, repo, jobId, 'vscode-copilot-chat', { createIfNone: true });
+			const jobInfo = await this._octoKitService.getJobByJobId(owner, repo, jobId, 'vscode-copilot-chat', CLOUD_SESSIONS_AUTH_OPTIONS);
 			if (jobInfo && jobInfo.pull_request && jobInfo.pull_request.number) {
 				/* __GDPR__
 					"copilotcloud.chat.remoteAgentJobPullRequestReady" : {
@@ -2484,7 +2583,7 @@ export class CopilotCloudSessionsProvider extends Disposable implements vscode.C
 
 		stream?.progress(vscode.l10n.t('Delegating to cloud agent'));
 		this.logService.debug(`[postCopilotAgentJob] Invoking cloud agent job with payload: ${JSON.stringify(payload)}`);
-		const response = await this._octoKitService.postCopilotAgentJob(repoOwner, repoName, JOBS_API_VERSION, payload, { createIfNone: true });
+		const response = await this._octoKitService.postCopilotAgentJob(repoOwner, repoName, JOBS_API_VERSION, payload, CLOUD_SESSIONS_AUTH_OPTIONS);
 		this.logService.debug(`[postCopilotAgentJob] Received response from cloud agent job invocation: ${JSON.stringify(response)}`);
 		if (!this.validateRemoteAgentJobResponse(response)) {
 			const statusCode = response?.status;
