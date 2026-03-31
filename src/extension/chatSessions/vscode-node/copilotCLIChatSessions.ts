@@ -28,6 +28,7 @@ import { Disposable, DisposableStore, IDisposable, IReference } from '../../../u
 import { ResourceMap } from '../../../util/vs/base/common/map';
 import { relative } from '../../../util/vs/base/common/path';
 import { basename, dirname, extUri } from '../../../util/vs/base/common/resources';
+import { StopWatch } from '../../../util/vs/base/common/stopwatch';
 import { URI } from '../../../util/vs/base/common/uri';
 import { EXTENSION_ID } from '../../common/constants';
 import { ChatVariablesCollection, extractDebugTargetSessionIds, isPromptFile } from '../../prompt/common/chatVariablesCollection';
@@ -438,6 +439,7 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 		} else {
 			// Workspace
 			const sessionRequestDetails = await this.chatSessionMetadataStore.getRequestDetails(session.id);
+			const workspaceFolderEntry = await this.chatSessionMetadataStore.getSessionWorkspaceFolderEntry(session.id);
 
 			let lastCheckpointRef: string | undefined;
 			for (let i = sessionRequestDetails.length - 1; i >= 0; i--) {
@@ -454,7 +456,7 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 
 			metadata = {
 				isolationMode: IsolationMode.Workspace,
-				repositoryPath: session.repositoryDirectory?.fsPath,
+				repositoryPath: workspaceFolderEntry?.repositoryPath,
 				workingDirectoryPath: workingDirectory?.fsPath,
 				firstCheckpointRef,
 				lastCheckpointRef
@@ -511,27 +513,32 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 	}
 
 	async provideChatSessionContent(resource: Uri, token: vscode.CancellationToken, _context?: { readonly inputState: vscode.ChatSessionInputState; readonly sessionOptions: ReadonlyArray<{ optionId: string; value: string | vscode.ChatSessionProviderOptionItem }> }): Promise<vscode.ChatSession> {
-		const copilotcliSessionId = SessionIdForCLI.parse(resource);
-		if (copilotcliSessionId.startsWith('untitled:') || copilotcliSessionId.startsWith('untitled-')) {
-			return {
-				history: [],
-				requestHandler: undefined,
-			};
-		}
-		if (this.sessionService.isNewSessionId(copilotcliSessionId)) {
-			const session = this.newSessions.get(resource);
-			if (!session) {
-				throw new Error('Session not found');
+		const stopwatch = new StopWatch();
+		try {
+			const copilotcliSessionId = SessionIdForCLI.parse(resource);
+			if (copilotcliSessionId.startsWith('untitled:') || copilotcliSessionId.startsWith('untitled-')) {
+				return {
+					history: [],
+					requestHandler: undefined,
+				};
 			}
-			return {
-				history: [],
-				requestHandler: undefined,
-				title: session.label,
-				activeResponseCallback: undefined,
-				options: {},
-			};
-		} else {
-			return this.provideChatSessionContentForExistingSession(resource, token);
+			if (this.sessionService.isNewSessionId(copilotcliSessionId)) {
+				const session = this.newSessions.get(resource);
+				if (!session) {
+					throw new Error('Session not found');
+				}
+				return {
+					history: [],
+					requestHandler: undefined,
+					title: session.label,
+					activeResponseCallback: undefined,
+					options: {},
+				};
+			} else {
+				return await this.provideChatSessionContentForExistingSession(resource, token);
+			}
+		} finally {
+			this.logService.info(`[CopilotCLIChatSessionContentProvider] provideChatSessionContent for ${resource.toString()} took ${stopwatch.elapsed()}ms`);
 		}
 	}
 
@@ -556,16 +563,10 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 	}
 
 	private async getSessionHistory(sessionId: string, workspaceInfo: IWorkspaceInfo, token: vscode.CancellationToken) {
-		const disposables = new DisposableStore();
 		try {
-			const session = await this.sessionService.getSession({ sessionId, workspaceInfo, readonly: true }, token);
-			if (session) {
-				disposables.add(session);
-				_invalidCopilotCLISessionIdsWithErrorMessage.delete(sessionId);
-				const history = await session.object.getChatHistory();
-				return history;
-			}
-			return [];
+			_invalidCopilotCLISessionIdsWithErrorMessage.delete(sessionId);
+			const history = await this.sessionService.getChatHistory({ sessionId, workspace: workspaceInfo }, token);
+			return history;
 		} catch (error) {
 			if (!isUnknownEventTypeError(error)) {
 				throw error;
@@ -578,8 +579,6 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 			}
 
 			throw error;
-		} finally {
-			disposables.dispose();
 		}
 	}
 
@@ -1361,7 +1360,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		const mcpServerMappings = buildMcpServerMappings(request.tools);
 		const session = isNewSession ?
 			await this.sessionService.createSession({ sessionId, model, workspaceInfo, agent, debugTargetSessionIds, mcpServerMappings }, token) :
-			await this.sessionService.getSession({ sessionId, model, workspaceInfo, agent, readonly: false, debugTargetSessionIds, mcpServerMappings }, token);
+			await this.sessionService.getSession({ sessionId, model, workspaceInfo, agent, debugTargetSessionIds, mcpServerMappings }, token);
 
 		if (!session) {
 			stream.warning(l10n.t('Chat session not found.'));
@@ -1376,7 +1375,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		}
 		const sessionWorkingDirectory = getWorkingDirectory(session.object.workspace);
 		if (sessionWorkingDirectory && !isIsolationEnabled(session.object.workspace)) {
-			void this.workspaceFolderService.trackSessionWorkspaceFolder(session.object.sessionId, sessionWorkingDirectory.fsPath);
+			void this.workspaceFolderService.trackSessionWorkspaceFolder(session.object.sessionId, sessionWorkingDirectory.fsPath, session.object.workspace.repository?.fsPath);
 		}
 		disposables.add(session.object.attachStream(stream));
 		const permissionLevel = request.permissionLevel;
@@ -1532,7 +1531,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			void this.copilotCLIWorktreeManagerService.setWorktreeProperties(session.object.sessionId, worktreeProperties);
 		}
 		if (workingDirectory && !isIsolationEnabled(workspaceInfo)) {
-			void this.workspaceFolderService.trackSessionWorkspaceFolder(session.object.sessionId, workingDirectory.fsPath);
+			void this.workspaceFolderService.trackSessionWorkspaceFolder(session.object.sessionId, workingDirectory.fsPath, workspaceInfo.repository?.fsPath);
 		}
 
 		try {
