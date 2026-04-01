@@ -243,7 +243,7 @@ export abstract class FolderRepositoryManager extends Disposable implements IFol
 			this.logService.info(`[FolderRepositoryManager] Workspace isolation mode selected for session ${sessionId}, skipping worktree creation`);
 			return {
 				folder: folder ?? repository,
-				repository: undefined,
+				repository,
 				worktree: undefined,
 				worktreeProperties: undefined,
 				trusted: true
@@ -267,7 +267,7 @@ export abstract class FolderRepositoryManager extends Disposable implements IFol
 
 			return {
 				folder: folder ?? repository,
-				repository: repository,
+				repository,
 				worktree,
 				worktreeProperties,
 				trusted
@@ -292,7 +292,7 @@ export abstract class FolderRepositoryManager extends Disposable implements IFol
 
 		return {
 			folder: folder ?? repository,
-			repository: repository,
+			repository,
 			worktree: worktree ?? vscode.Uri.file(worktreeProperties.worktreePath),
 			worktreeProperties,
 			trusted: true
@@ -643,16 +643,18 @@ export class CopilotCLIFolderRepositoryManager extends FolderRepositoryManager {
 		}
 
 		// Check session workspace folder
-		const sessionWorkspaceFolder = await this.workspaceFolderService.getSessionWorkspaceFolder(sessionId);
-		if (sessionWorkspaceFolder) {
+		const sessionWorkspaceFolderEntry = await this.workspaceFolderService.getSessionWorkspaceFolderEntry(sessionId);
+		if (sessionWorkspaceFolderEntry) {
 			let trusted: boolean | undefined;
 			if (options) {
-				trusted = await this.verifyTrust(sessionWorkspaceFolder, options.stream);
+				trusted = await this.verifyTrust(vscode.Uri.file(sessionWorkspaceFolderEntry.folderPath), options.stream);
 			}
 
 			return {
-				folder: sessionWorkspaceFolder,
-				repository: undefined,
+				folder: vscode.Uri.file(sessionWorkspaceFolderEntry.folderPath),
+				repository: sessionWorkspaceFolderEntry.repositoryPath
+					? vscode.Uri.file(sessionWorkspaceFolderEntry.repositoryPath)
+					: undefined,
 				worktree: undefined,
 				worktreeProperties: undefined,
 				trusted
