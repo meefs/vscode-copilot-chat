@@ -316,6 +316,28 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 			controller.items.add(item);
 		}));
 
+		// Handle worktree cleanup/recreation when archive state changes
+		if (controller.onDidChangeChatSessionItemState) {
+			this._register(controller.onDidChangeChatSessionItemState(async (item) => {
+				const sessionId = SessionIdForCLI.parse(item.resource);
+				if (item.archived) {
+					try {
+						const result = await this.copilotCLIWorktreeManagerService.cleanupWorktreeOnArchive(sessionId);
+						this.logService.trace(`[CopilotCLI] Worktree cleanup for session ${sessionId}: ${result.cleaned ? 'cleaned' : result.reason}`);
+					} catch (error) {
+						this.logService.error(`[CopilotCLI] Failed to cleanup worktree for archived session ${sessionId}:`, error);
+					}
+				} else {
+					try {
+						const result = await this.copilotCLIWorktreeManagerService.recreateWorktreeOnUnarchive(sessionId);
+						this.logService.trace(`[CopilotCLI] Worktree recreation for session ${sessionId}: ${result.recreated ? 'recreated' : result.reason}`);
+					} catch (error) {
+						this.logService.error(`[CopilotCLI] Failed to recreate worktree for unarchived session ${sessionId}:`, error);
+					}
+				}
+			}));
+		}
+
 		controller.getChatSessionInputState = async (sessionResource, context, token) => {
 			const groups = sessionResource ? await this.buildExistingSessionInputStateGroups(sessionResource, token) : await this.provideChatSessionProviderOptionGroups(context.previousInputState);
 			return controller.createChatSessionInputState(groups);
@@ -390,7 +412,7 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 			changes.push(...(await this.copilotCLIWorktreeManagerService.getWorktreeChanges(session.id) ?? []));
 		} else if (workingDirectory && await vscode.workspace.isResourceTrusted(workingDirectory)) {
 			// Workspace
-			const workspaceChanges = await this.workspaceFolderService.getWorkspaceChanges(workingDirectory) ?? [];
+			const workspaceChanges = await this.workspaceFolderService.getWorkspaceChanges(session.id) ?? [];
 			changes.push(...workspaceChanges.map(change => new vscode.ChatSessionChangedFile2(
 				vscode.Uri.file(change.filePath),
 				change.originalFilePath
@@ -443,7 +465,7 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 		} else {
 			// Workspace
 			const sessionRequestDetails = await this.chatSessionMetadataStore.getRequestDetails(session.id);
-			const workspaceFolderEntry = await this.chatSessionMetadataStore.getSessionWorkspaceFolderEntry(session.id);
+			const repositoryProperties = await this.chatSessionMetadataStore.getRepositoryProperties(session.id);
 
 			let lastCheckpointRef: string | undefined;
 			for (let i = sessionRequestDetails.length - 1; i >= 0; i--) {
@@ -460,7 +482,9 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 
 			metadata = {
 				isolationMode: IsolationMode.Workspace,
-				repositoryPath: workspaceFolderEntry?.repositoryPath,
+				repositoryPath: repositoryProperties?.repositoryPath,
+				branchName: repositoryProperties?.branchName,
+				baseBranchName: repositoryProperties?.baseBranchName,
 				workingDirectoryPath: workingDirectory?.fsPath,
 				firstCheckpointRef,
 				lastCheckpointRef
@@ -487,8 +511,11 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 				|| worktreeProperties.pullRequestState === 'merged'
 				|| !worktreeProperties.branchName
 				|| !worktreeProperties.repositoryPath) {
+				this.logService.debug(`[CopilotCLIChatSessionItemProvider] Skipping PR detection on session open for ${sessionId}: version=${worktreeProperties?.version}, prState=${worktreeProperties?.version === 2 ? worktreeProperties.pullRequestState : 'n/a'}, branch=${!!worktreeProperties?.branchName}, repoPath=${!!worktreeProperties?.repositoryPath}`);
 				return;
 			}
+
+			this.logService.debug(`[CopilotCLIChatSessionItemProvider] Detecting PR on session open for ${sessionId}, branch=${worktreeProperties.branchName}, existingPrUrl=${worktreeProperties.pullRequestUrl ?? 'none'}`);
 
 			const prResult = await detectPullRequestFromGitHubAPI(
 				worktreeProperties.branchName,
@@ -502,6 +529,7 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 				const currentProperties = await this.copilotCLIWorktreeManagerService.getWorktreeProperties(sessionId);
 				if (currentProperties?.version === 2
 					&& (currentProperties.pullRequestUrl !== prResult.url || currentProperties.pullRequestState !== prResult.state)) {
+					this.logService.debug(`[CopilotCLIChatSessionItemProvider] Updating PR metadata for ${sessionId}: url=${prResult.url}, state=${prResult.state} (was url=${currentProperties.pullRequestUrl ?? 'none'}, state=${currentProperties.pullRequestState ?? 'none'})`);
 					await this.copilotCLIWorktreeManagerService.setWorktreeProperties(sessionId, {
 						...currentProperties,
 						pullRequestUrl: prResult.url,
@@ -509,7 +537,11 @@ export class CopilotCLIChatSessionContentProvider extends Disposable implements 
 						changes: undefined,
 					});
 					await this.refreshSession({ reason: 'update', sessionId });
+				} else {
+					this.logService.debug(`[CopilotCLIChatSessionItemProvider] PR metadata unchanged for ${sessionId}, skipping update`);
 				}
+			} else {
+				this.logService.debug(`[CopilotCLIChatSessionItemProvider] No PR found via GitHub API for ${sessionId}`);
 			}
 		} catch (error) {
 			this.logService.trace(`[CopilotCLIChatSessionItemProvider] Failed to detect pull request on session open for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
@@ -1211,7 +1243,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 					// When isolation is not enabled, we are operating in the workspace directly,
 					// so we stage all the changes in the workspace directory when the session is
 					// completed
-					await this.workspaceFolderService.handleRequestCompleted(workingDirectory);
+					await this.workspaceFolderService.handleRequestCompleted(session.sessionId);
 				}
 
 				// Create checkpoint - we create a checkpoint for the worktree changes so that users
@@ -1235,6 +1267,8 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		let prUrl = session.createdPullRequestUrl;
 		let prState = 'open';
 
+		this.logService.debug(`[CopilotCLIChatSessionParticipant] handlePullRequestCreated for ${sessionId}: createdPullRequestUrl=${prUrl ?? 'none'}`);
+
 		const worktreeProperties = await this.copilotCLIWorktreeManagerService.getWorktreeProperties(sessionId);
 		if (!worktreeProperties || worktreeProperties.version !== 2) {
 			return;
@@ -1245,13 +1279,17 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			// with branch info — v1 worktrees can't store PR URLs, and sessions
 			// without worktree properties have nothing to look up.
 			if (worktreeProperties.branchName && worktreeProperties.repositoryPath) {
+				this.logService.debug(`[CopilotCLIChatSessionParticipant] No PR URL from session, attempting retry detection for ${sessionId}, branch=${worktreeProperties.branchName}`);
 				const prResult = await this.detectPullRequestWithRetry(sessionId);
 				prUrl = prResult?.url;
 				prState = prResult?.state ?? 'open';
+			} else {
+				this.logService.debug(`[CopilotCLIChatSessionParticipant] Skipping retry detection for ${sessionId}: branch=${worktreeProperties.branchName ?? 'none'}, repoPath=${!!worktreeProperties.repositoryPath}`);
 			}
 		}
 
 		if (!prUrl) {
+			this.logService.debug(`[CopilotCLIChatSessionParticipant] No PR detected for ${sessionId} after all attempts`);
 			return;
 		}
 
@@ -1280,14 +1318,17 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 
 		for (let attempt = 0; attempt < maxRetries; attempt++) {
 			const delay = initialDelay * Math.pow(2, attempt);
+			this.logService.debug(`[CopilotCLIChatSessionParticipant] PR detection retry for ${sessionId}: attempt ${attempt + 1}/${maxRetries}, waiting ${delay}ms`);
 			await new Promise<void>(resolve => setTimeout(resolve, delay));
 
 			const prResult = await this.detectPullRequestForSession(sessionId);
 			if (prResult) {
+				this.logService.debug(`[CopilotCLIChatSessionParticipant] PR detected on attempt ${attempt + 1} for ${sessionId}: url=${prResult.url}, state=${prResult.state}`);
 				return prResult;
 			}
 		}
 
+		this.logService.debug(`[CopilotCLIChatSessionParticipant] PR detection exhausted all ${maxRetries} retries for ${sessionId}`);
 		return undefined;
 	}
 
@@ -1301,6 +1342,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		try {
 			const worktreeProperties = await this.copilotCLIWorktreeManagerService.getWorktreeProperties(sessionId);
 			if (!worktreeProperties?.branchName || !worktreeProperties.repositoryPath) {
+				this.logService.debug(`[CopilotCLIChatSessionParticipant] detectPullRequestForSession: missing worktree info for ${sessionId}, branch=${worktreeProperties?.branchName ?? 'none'}, repoPath=${!!worktreeProperties?.repositoryPath}`);
 				return undefined;
 			}
 
@@ -1385,7 +1427,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 		}
 		const sessionWorkingDirectory = getWorkingDirectory(session.object.workspace);
 		if (sessionWorkingDirectory && !isIsolationEnabled(session.object.workspace)) {
-			void this.workspaceFolderService.trackSessionWorkspaceFolder(session.object.sessionId, sessionWorkingDirectory.fsPath, session.object.workspace.repository?.fsPath);
+			void this.workspaceFolderService.trackSessionWorkspaceFolder(session.object.sessionId, sessionWorkingDirectory.fsPath, session.object.workspace.repositoryProperties);
 		}
 		disposables.add(session.object.attachStream(stream));
 		const permissionLevel = request.permissionLevel;
@@ -1542,7 +1584,7 @@ export class CopilotCLIChatSessionParticipant extends Disposable {
 			void this.copilotCLIWorktreeManagerService.setWorktreeProperties(session.object.sessionId, worktreeProperties);
 		}
 		if (workingDirectory && !isIsolationEnabled(workspaceInfo)) {
-			void this.workspaceFolderService.trackSessionWorkspaceFolder(session.object.sessionId, workingDirectory.fsPath, workspaceInfo.repository?.fsPath);
+			void this.workspaceFolderService.trackSessionWorkspaceFolder(session.object.sessionId, workingDirectory.fsPath, workspaceInfo.repositoryProperties);
 		}
 
 		try {
@@ -2053,7 +2095,7 @@ export function registerCLIChatCommands(
 			});
 		} else if (workspaceFolder) {
 			// Workspace
-			copilotCliWorkspaceSession.clearWorkspaceChanges(workspaceFolder);
+			copilotCliWorkspaceSession.clearWorkspaceChanges(sessionId);
 		}
 
 		await contentProvider.refreshSession({ reason: 'update', sessionId });
@@ -2079,8 +2121,8 @@ export function registerCLIChatCommands(
 			return;
 		}
 
-		copilotCliWorkspaceSession.trackSessionWorkspaceFolder(sessionId, workspaceFolder.fsPath, repository.rootUri.fsPath);
-		copilotCliWorkspaceSession.clearWorkspaceChanges(workspaceFolder);
+		copilotCliWorkspaceSession.trackSessionWorkspaceFolder(sessionId, workspaceFolder.fsPath, repository.headBranchName ? { repositoryPath: repository.rootUri.fsPath, branchName: repository.headBranchName } : undefined);
+		copilotCliWorkspaceSession.clearWorkspaceChanges(sessionId);
 
 		await contentProvider.refreshSession({ reason: 'update', sessionId });
 	}));
@@ -2403,13 +2445,17 @@ async function detectPullRequestFromGitHubAPI(
 ): Promise<{ url: string; state: string } | undefined> {
 	const repoContext = await gitService.getRepository(URI.file(repositoryPath));
 	if (!repoContext) {
+		logService.debug(`[detectPullRequestFromGitHubAPI] No git repository found for path: ${repositoryPath}`);
 		return undefined;
 	}
 
 	const repoInfo = getGitHubRepoInfoFromContext(repoContext);
 	if (!repoInfo) {
+		logService.debug(`[detectPullRequestFromGitHubAPI] Could not extract GitHub repo info from repository at: ${repositoryPath}`);
 		return undefined;
 	}
+
+	logService.debug(`[detectPullRequestFromGitHubAPI] Querying GitHub API for PR on ${repoInfo.id.org}/${repoInfo.id.repo}, branch=${branchName}`);
 
 	const pr = await octoKitService.findPullRequestByHeadBranch(
 		repoInfo.id.org,
@@ -2424,5 +2470,6 @@ async function detectPullRequestFromGitHubAPI(
 		return { url: pr.url, state: prState };
 	}
 
+	logService.debug(`[detectPullRequestFromGitHubAPI] No PR found for ${repoInfo.id.org}/${repoInfo.id.repo}, branch=${branchName}`);
 	return undefined;
 }
