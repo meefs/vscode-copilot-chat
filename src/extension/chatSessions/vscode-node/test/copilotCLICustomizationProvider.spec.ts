@@ -21,6 +21,7 @@ class FakeChatSessionCustomizationType {
 	static readonly Instructions = new FakeChatSessionCustomizationType('instructions');
 	static readonly Prompt = new FakeChatSessionCustomizationType('prompt');
 	static readonly Hook = new FakeChatSessionCustomizationType('hook');
+	static readonly Plugins = new FakeChatSessionCustomizationType('plugins');
 	constructor(readonly id: string) { }
 }
 
@@ -58,27 +59,41 @@ class MockChatPromptFileService extends mock<IChatPromptFileService>() {
 	override readonly onDidChangeInstructions = this._onDidChangeInstructions.event;
 	private readonly _onDidChangeSkills = new Emitter<void>();
 	override readonly onDidChangeSkills = this._onDidChangeSkills.event;
+	private readonly _onDidChangeHooks = new Emitter<void>();
+	override readonly onDidChangeHooks = this._onDidChangeHooks.event;
+	private readonly _onDidChangePlugins = new Emitter<void>();
+	override readonly onDidChangePlugins = this._onDidChangePlugins.event;
 
 	private _customAgents: vscode.ChatResource[] = [];
 	private _instructions: vscode.ChatResource[] = [];
 	private _skills: vscode.ChatResource[] = [];
+	private _hooks: vscode.ChatResource[] = [];
+	private _plugins: vscode.ChatResource[] = [];
 
 	override get customAgents(): readonly vscode.ChatResource[] { return this._customAgents; }
 	override get instructions(): readonly vscode.ChatResource[] { return this._instructions; }
 	override get skills(): readonly vscode.ChatResource[] { return this._skills; }
+	override get hooks(): readonly vscode.ChatResource[] { return this._hooks; }
+	override get plugins(): readonly vscode.ChatResource[] { return this._plugins; }
 
 	setCustomAgents(agents: vscode.ChatResource[]) { this._customAgents = agents; }
 	setInstructions(instructions: vscode.ChatResource[]) { this._instructions = instructions; }
 	setSkills(skills: vscode.ChatResource[]) { this._skills = skills; }
+	setHooks(hooks: vscode.ChatResource[]) { this._hooks = hooks; }
+	setPlugins(plugins: vscode.ChatResource[]) { this._plugins = plugins; }
 
 	fireCustomAgentsChanged() { this._onDidChangeCustomAgents.fire(); }
 	fireInstructionsChanged() { this._onDidChangeInstructions.fire(); }
 	fireSkillsChanged() { this._onDidChangeSkills.fire(); }
+	fireHooksChanged() { this._onDidChangeHooks.fire(); }
+	firePluginsChanged() { this._onDidChangePlugins.fire(); }
 
 	override dispose() {
 		this._onDidChangeCustomAgents.dispose();
 		this._onDidChangeInstructions.dispose();
 		this._onDidChangeSkills.dispose();
+		this._onDidChangeHooks.dispose();
+		this._onDidChangePlugins.dispose();
 	}
 }
 
@@ -130,13 +145,15 @@ describe('CopilotCLICustomizationProvider', () => {
 			expect(CopilotCLICustomizationProvider.metadata.iconId).toBe('worktree');
 		});
 
-		it('supports Agent, Skill, and Instructions types', () => {
+		it('supports Agent, Skill, Instructions, Hook, and Plugins types', () => {
 			const supported = CopilotCLICustomizationProvider.metadata.supportedTypes;
 			expect(supported).toBeDefined();
-			expect(supported).toHaveLength(3);
+			expect(supported).toHaveLength(5);
 			expect(supported).toContain(FakeChatSessionCustomizationType.Agent);
 			expect(supported).toContain(FakeChatSessionCustomizationType.Skill);
 			expect(supported).toContain(FakeChatSessionCustomizationType.Instructions);
+			expect(supported).toContain(FakeChatSessionCustomizationType.Hook);
+			expect(supported).toContain(FakeChatSessionCustomizationType.Plugins);
 		});
 
 		it('only returns items whose type is in supportedTypes', async () => {
@@ -240,9 +257,51 @@ describe('CopilotCLICustomizationProvider', () => {
 			mockCopilotCLIAgents.setAgents([makeAgentInfo('explore', 'Explore')]);
 			mockPromptFileService.setInstructions([{ uri: URI.file('/workspace/.github/b.instructions.md') }]);
 			mockPromptFileService.setSkills([{ uri: URI.file('/workspace/.github/skills/c/SKILL.md') }]);
+			mockPromptFileService.setHooks([{ uri: URI.file('/workspace/.copilot/hooks/pre-commit.json') }]);
+			mockPromptFileService.setPlugins([{ uri: URI.file('/workspace/.copilot/plugins/my-plugin') }]);
 
 			const items = await provider.provideChatSessionCustomizations(undefined!);
-			expect(items).toHaveLength(3);
+			expect(items).toHaveLength(5);
+		});
+
+		it('returns hooks with correct type and name', async () => {
+			const uri = URI.file('/workspace/.copilot/hooks/diagnostics.json');
+			mockPromptFileService.setHooks([{ uri }]);
+
+			const items = await provider.provideChatSessionCustomizations(undefined!);
+			expect(items).toHaveLength(1);
+			expect(items[0].uri).toBe(uri);
+			expect(items[0].type).toBe(FakeChatSessionCustomizationType.Hook);
+			expect(items[0].name).toBe('diagnostics');
+		});
+
+		it('strips .json extension from hook file name', async () => {
+			mockPromptFileService.setHooks([{ uri: URI.file('/workspace/.copilot/hooks/security-checks.json') }]);
+
+			const items = await provider.provideChatSessionCustomizations(undefined!);
+			expect(items[0].name).toBe('security-checks');
+		});
+
+		it('returns multiple hooks', async () => {
+			mockPromptFileService.setHooks([
+				{ uri: URI.file('/workspace/.copilot/hooks/hooks.json') },
+				{ uri: URI.file('/workspace/.copilot/hooks/diagnostics.json') },
+			]);
+
+			const items = await provider.provideChatSessionCustomizations(undefined!);
+			const hookItems = items.filter((i: vscode.ChatSessionCustomizationItem) => i.type === FakeChatSessionCustomizationType.Hook);
+			expect(hookItems).toHaveLength(2);
+		});
+
+		it('returns plugins with correct type and name derived from URI', async () => {
+			const uri = URI.file('/workspace/.copilot/plugins/lint-rules');
+			mockPromptFileService.setPlugins([{ uri }]);
+
+			const items = await provider.provideChatSessionCustomizations(undefined!);
+			expect(items).toHaveLength(1);
+			expect(items[0].uri).toEqual(uri);
+			expect(items[0].type).toBe(FakeChatSessionCustomizationType.Plugins);
+			expect(items[0].name).toBe('lint-rules');
 		});
 	});
 
@@ -268,6 +327,22 @@ describe('CopilotCLICustomizationProvider', () => {
 			disposables.add(provider.onDidChange(() => { fired = true; }));
 
 			mockPromptFileService.fireSkillsChanged();
+			expect(fired).toBe(true);
+		});
+
+		it('fires when hooks change', () => {
+			let fired = false;
+			disposables.add(provider.onDidChange(() => { fired = true; }));
+
+			mockPromptFileService.fireHooksChanged();
+			expect(fired).toBe(true);
+		});
+
+		it('fires when plugins change', () => {
+			let fired = false;
+			disposables.add(provider.onDidChange(() => { fired = true; }));
+
+			mockPromptFileService.firePluginsChanged();
 			expect(fired).toBe(true);
 		});
 
